@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.0.2](https://github.com/jdx/jdx-tar/compare/v0.0.1...v0.0.2) - 2026-07-15
+
+### Other
+
+- split format and unpack modules ([#9](https://github.com/jdx/jdx-tar/pull/9))
+- cover unpack callbacks and summary ([#8](https://github.com/jdx/jdx-tar/pull/8))
+- correct windows sparse behavior and tighten readme prose ([#7](https://github.com/jdx/jdx-tar/pull/7))
+- welcome tar writing contributions ([#6](https://github.com/jdx/jdx-tar/pull/6))
+
 ## [0.0.1](https://github.com/jdx/jdx-tar/compare/v0.0.0...v0.0.1) - 2026-07-15
 
 ### Fixed

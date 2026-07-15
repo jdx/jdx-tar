@@ -1,6 +1,6 @@
 [package]
 name = "jdx-tar"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Secure streaming tar extraction with complete GNU sparse support"
