@@ -1,0 +1,28 @@
+[package]
+name = "jdx-tar"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Secure streaming tar extraction with complete GNU sparse support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jdx/jdx-tar"
+homepage = "https://github.com/jdx/jdx-tar"
+documentation = "https://docs.rs/jdx-tar"
+readme = "README.md"
+keywords = ["tar", "archive", "sparse", "extract"]
+categories = ["compression", "filesystem"]
+exclude = ["tests/fixtures/**"]
+
+[dependencies]
+filetime = "0.2.25"
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+

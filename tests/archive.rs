@@ -1,0 +1,248 @@
+use jdx_tar::{Archive, SparseSegment, UnpackOptions};
+use std::io::{Cursor, Read};
+
+fn octal(field: &mut [u8], value: u64) {
+    field.fill(0);
+    let text = format!("{:0width$o}", value, width = field.len() - 1);
+    field[..text.len()].copy_from_slice(text.as_bytes());
+}
+
+fn header(name: &str, size: u64, kind: u8) -> [u8; 512] {
+    let mut block = [0_u8; 512];
+    block[..name.len()].copy_from_slice(name.as_bytes());
+    octal(&mut block[100..108], 0o644);
+    octal(&mut block[108..116], 0);
+    octal(&mut block[116..124], 0);
+    octal(&mut block[124..136], size);
+    octal(&mut block[136..148], 1_700_000_000);
+    block[148..156].fill(b' ');
+    block[156] = kind;
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    let checksum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
+    let sum = format!("{checksum:06o}\0 ");
+    block[148..156].copy_from_slice(sum.as_bytes());
+    block
+}
+
+fn finish_header(block: &mut [u8; 512]) {
+    block[148..156].fill(b' ');
+    let checksum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
+    let sum = format!("{checksum:06o}\0 ");
+    block[148..156].copy_from_slice(sum.as_bytes());
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn append_entry(tar: &mut Vec<u8>, block: [u8; 512], data: &[u8]) {
+    tar.extend_from_slice(&block);
+    tar.extend_from_slice(data);
+    tar.resize(tar.len().div_ceil(512) * 512, 0);
+}
+
+fn pax_record(key: &str, value: &str) -> String {
+    let body = format!(" {key}={value}\n");
+    let mut length = body.len() + 1;
+    loop {
+        let record = format!("{length}{body}");
+        if record.len() == length {
+            return record;
+        }
+        length = record.len();
+    }
+}
+
+fn pax_header(records: &[(&str, &str)]) -> (Vec<u8>, [u8; 512]) {
+    let data = records
+        .iter()
+        .map(|(key, value)| pax_record(key, value))
+        .collect::<String>()
+        .into_bytes();
+    let block = header("PaxHeaders/test", data.len() as u64, b'x');
+    (data, block)
+}
+
+fn terminate(tar: &mut Vec<u8>) {
+    tar.resize(tar.len() + 1024, 0);
+}
+
+#[test]
+fn reads_dense_and_pax_path() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[("path", "deep/δ/file.txt")]);
+    append_entry(&mut tar, pax_block, &pax);
+    append_entry(&mut tar, header("ignored", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    assert_eq!(entry.path().unwrap().to_string_lossy(), "deep/δ/file.txt");
+    let mut body = String::new();
+    entry.read_to_string(&mut body).unwrap();
+    assert_eq!(body, "hello");
+    assert!(entries.next().is_none());
+}
+
+#[test]
+fn reads_pax_sparse_1_0_as_logical_content() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[
+        ("GNU.sparse.major", "1"),
+        ("GNU.sparse.minor", "0"),
+        ("GNU.sparse.name", "root/sparse.bin"),
+        ("GNU.sparse.realsize", "20"),
+    ]);
+    append_entry(&mut tar, pax_block, &pax);
+    let map = b"2\n2\n3\n15\n2\n";
+    let mut physical = map.to_vec();
+    physical.resize(512, 0);
+    physical.extend_from_slice(b"abcXY");
+    append_entry(
+        &mut tar,
+        header("GNUSparseFile.1/sparse.bin", physical.len() as u64, b'0'),
+        &physical,
+    );
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    assert_eq!(entry.path().unwrap().to_string_lossy(), "root/sparse.bin");
+    assert_eq!(entry.size(), 20);
+    assert_eq!(
+        entry.sparse_map().unwrap(),
+        [
+            SparseSegment { offset: 2, len: 3 },
+            SparseSegment { offset: 15, len: 2 }
+        ]
+    );
+    let mut body = Vec::new();
+    entry.read_to_end(&mut body).unwrap();
+    assert_eq!(&body[2..5], b"abc");
+    assert_eq!(&body[15..17], b"XY");
+    assert!(
+        body[..2]
+            .iter()
+            .chain(&body[5..15])
+            .chain(&body[17..])
+            .all(|b| *b == 0)
+    );
+}
+
+#[test]
+fn reads_pax_sparse_0_0_and_0_1() {
+    for records in [
+        vec![
+            ("GNU.sparse.major", "0"),
+            ("GNU.sparse.minor", "0"),
+            ("GNU.sparse.size", "12"),
+            ("GNU.sparse.numblocks", "2"),
+            ("GNU.sparse.offset", "1"),
+            ("GNU.sparse.numbytes", "2"),
+            ("GNU.sparse.offset", "9"),
+            ("GNU.sparse.numbytes", "1"),
+        ],
+        vec![
+            ("GNU.sparse.major", "0"),
+            ("GNU.sparse.minor", "1"),
+            ("GNU.sparse.size", "12"),
+            ("GNU.sparse.map", "1,2,9,1"),
+        ],
+    ] {
+        let mut tar = Vec::new();
+        let (pax, pax_block) = pax_header(&records);
+        append_entry(&mut tar, pax_block, &pax);
+        append_entry(&mut tar, header("sparse", 3, b'0'), b"abc");
+        terminate(&mut tar);
+        let mut archive = Archive::new(Cursor::new(tar));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        assert_eq!(body.len(), 12);
+        assert_eq!(&body[1..3], b"ab");
+        assert_eq!(body[9], b'c');
+    }
+}
+
+#[test]
+fn reads_old_gnu_sparse() {
+    let mut tar = Vec::new();
+    let mut block = header("old-sparse", 3, b'S');
+    block[257..265].copy_from_slice(b"ustar  \0");
+    octal(&mut block[386..398], 2);
+    octal(&mut block[398..410], 2);
+    octal(&mut block[410..422], 10);
+    octal(&mut block[422..434], 1);
+    octal(&mut block[483..495], 16);
+    finish_header(&mut block);
+    append_entry(&mut tar, block, b"abc");
+    terminate(&mut tar);
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    let mut body = Vec::new();
+    entry.read_to_end(&mut body).unwrap();
+    assert_eq!(&body[2..4], b"ab");
+    assert_eq!(body[10], b'c');
+    assert_eq!(body.len(), 16);
+}
+
+#[test]
+fn secure_unpack_strips_after_sparse_name_resolution() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[
+        ("GNU.sparse.major", "1"),
+        ("GNU.sparse.minor", "0"),
+        ("GNU.sparse.name", "one/two/file"),
+        ("GNU.sparse.realsize", "4"),
+    ]);
+    append_entry(&mut tar, pax_block, &pax);
+    let mut physical = b"0\n".to_vec();
+    physical.resize(512, 0);
+    append_entry(&mut tar, header("mangled", 512, b'0'), &physical);
+    terminate(&mut tar);
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = UnpackOptions::default();
+    options.strip_components = 2;
+    let summary = Archive::new(Cursor::new(tar))
+        .unpack(temp.path(), &mut options)
+        .unwrap();
+    assert_eq!(summary.sparse_files, 1);
+    assert_eq!(
+        std::fs::metadata(temp.path().join("file")).unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn rejects_traversal_checksum_and_symlink_escape() {
+    let mut traversal = Vec::new();
+    append_entry(&mut traversal, header("../outside", 1, b'0'), b"x");
+    terminate(&mut traversal);
+    let temp = tempfile::tempdir().unwrap();
+    assert!(
+        Archive::new(Cursor::new(traversal))
+            .unpack(temp.path(), &mut UnpackOptions::default())
+            .is_err()
+    );
+
+    let mut corrupt = header("file", 0, b'0').to_vec();
+    corrupt[0] ^= 1;
+    corrupt.resize(1536, 0);
+    let mut archive = Archive::new(Cursor::new(corrupt));
+    assert!(archive.entries().unwrap().next().unwrap().is_err());
+
+    let mut links = Vec::new();
+    let mut symlink = header("link", 0, b'2');
+    symlink[157..160].copy_from_slice(b"../");
+    finish_header(&mut symlink);
+    append_entry(&mut links, symlink, b"");
+    append_entry(&mut links, header("link/pwn", 1, b'0'), b"x");
+    terminate(&mut links);
+    assert!(
+        Archive::new(Cursor::new(links))
+            .unpack(temp.path(), &mut UnpackOptions::default())
+            .is_err()
+    );
+}

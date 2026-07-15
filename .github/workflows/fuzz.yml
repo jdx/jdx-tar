@@ -1,0 +1,15 @@
+name: Nightly fuzz smoke
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run read_unpack -- -runs=100000
+

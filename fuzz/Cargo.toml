@@ -1,0 +1,21 @@
+[package]
+name = "jdx-tar-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jdx-tar = { path = ".." }
+tempfile = "3"
+
+[[bin]]
+name = "read_unpack"
+path = "fuzz_targets/read_unpack.rs"
+test = false
+doc = false
+bench = false
+
