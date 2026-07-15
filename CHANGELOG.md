@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.0.1](https://github.com/jdx/jdx-tar/compare/v0.0.0...v0.0.1) - 2026-07-15
+
+### Fixed
+
+- account for unix-only permission metadata
+- avoid cross-toolchain unused binding warning
+
+### Other
+
+- add sparse archive compatibility corpus
+- expand readme with rationale, comparison table, and usage guidance ([#4](https://github.com/jdx/jdx-tar/pull/4))
+- Configure Renovate ([#1](https://github.com/jdx/jdx-tar/pull/1))
+- *(release)* add trusted release-plz workflow
+
 ## 0.0.0 - 2026-07-15
 
 - Initial placeholder release establishing the crate for trusted publishing.
