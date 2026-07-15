@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/jdx-tar/badge.svg)](https://docs.rs/jdx-tar)
 [![CI](https://github.com/jdx/jdx-tar/actions/workflows/ci.yml/badge.svg)](https://github.com/jdx/jdx-tar/actions/workflows/ci.yml)
 
-Synchronous, streaming tar extraction with support for all GNU sparse
-formats, including the PAX sparse formats that other pure-Rust tar crates
-cannot extract.
+Synchronous, streaming tar reading, writing, and extraction with support for
+all GNU sparse formats, including the PAX sparse formats that other pure-Rust
+tar crates cannot extract.
 
 ```rust
 use jdx_tar::{Archive, UnpackOptions};
@@ -20,6 +20,21 @@ println!("extracted {} files", summary.files);
 
 Input is anything that implements `Read`. Decompression is the caller's
 responsibility: wrap the file in a gzip/xz/zstd decoder first.
+
+Archives can also be written to any `Write` implementation:
+
+```rust
+use jdx_tar::{Builder, EntryType, Header};
+
+let mut output = Vec::new();
+let mut builder = Builder::new(&mut output);
+let mut header = Header::new_gnu(EntryType::File);
+header.set_mode(0o755);
+header.set_size(5);
+builder.append_data(&mut header, "bin/tool", &b"hello"[..])?;
+builder.finish()?;
+# Ok::<(), std::io::Error>(())
+```
 
 ## Why another tar crate?
 
@@ -46,13 +61,10 @@ contents are the raw sparse map and packed data.
 | Progress + per-entry callbacks             | ✅        | ❌                                             | ❌                                                                | ❌                  | ❌                      |
 | Secure extraction is the *only* mode       | ✅        | partial (unchecked `Entry::unpack` exists)     | ✅                                                                | ❌                  | ❌                      |
 | Pure Rust, no C, `unsafe_code = "forbid"`  | ✅        | ✅                                             | ✅                                                                | ❌ (links C)        | n/a                     |
-| Writes archives                            | ❌        | ✅                                             | ✅                                                                | ✅                  | ✅                      |
+| Writes archives                            | ✅        | ✅                                             | ✅                                                                | ✅                  | ✅                      |
 
 This crate's header parsing draws from the `tar` crate (see
-acknowledgements); use that or `astral-tokio-tar` if you need archive
-creation or an async API today. Archive writing is not implemented here yet,
-and a well-tested PR adding synchronous, streaming tar writing would be
-welcome.
+acknowledgements); use `astral-tokio-tar` if you need an async API.
 
 ## Features
 
@@ -70,6 +82,8 @@ welcome.
 - `EntryUnpacker` securely extracts selected entries, letting callers inspect
   or skip entries while retaining the same path, symlink, sparse-file, and
   deferred-directory-metadata handling as whole-archive extraction.
+- Deterministic, streaming GNU-format archive writing, including GNU long-name
+  and long-link records.
 - `strip_components` at any depth, applied after name resolution, plus
   `preserve_mtime`, `preserve_permissions`, and `overwrite`.
 - `on_progress` and `on_entry` callbacks. `unpack` returns an `UnpackSummary`

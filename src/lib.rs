@@ -1,8 +1,9 @@
-//! A secure, synchronous, streaming tar reader and extractor.
+//! A secure, synchronous, streaming tar reader, writer, and extractor.
 //!
 //! This crate reads already-decompressed tar streams and supports all GNU
 //! sparse formats commonly found in release archives.
 
+mod builder;
 mod format;
 mod unpack;
 
@@ -15,6 +16,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::rc::Rc;
 
+pub use builder::Builder;
 use format::{
     apply_pax_header, bytes_to_path, parse_decimal, parse_header, parse_number, parse_pax,
     parse_sparse_csv, parse_sparse_pairs, pax_text_checked, pax_u64_checked, pax_value,
@@ -77,6 +79,19 @@ impl EntryType {
             other => Self::Other(other),
         }
     }
+
+    const fn type_flag(self) -> u8 {
+        match self {
+            Self::File => b'0',
+            Self::Directory => b'5',
+            Self::Symlink => b'2',
+            Self::Hardlink => b'1',
+            Self::CharDevice => b'3',
+            Self::BlockDevice => b'4',
+            Self::Fifo => b'6',
+            Self::Other(flag) => flag,
+        }
+    }
 }
 
 /// Parsed metadata for a tar header.
@@ -93,6 +108,25 @@ pub struct Header {
 }
 
 impl Header {
+    /// Creates a deterministic GNU-format header for `entry_type`.
+    ///
+    /// Numeric fields default to zero. Callers must set the entry size before
+    /// appending regular-file data. Paths and checksums are populated by
+    /// [`Builder`].
+    #[must_use]
+    pub fn new_gnu(entry_type: EntryType) -> Self {
+        Self {
+            path: Vec::new(),
+            link_name: None,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            stored_size: 0,
+            mtime: 0,
+            type_flag: entry_type.type_flag(),
+        }
+    }
+
     /// File mode from the header.
     #[must_use]
     pub const fn mode(&self) -> u32 {
@@ -122,6 +156,31 @@ impl Header {
     #[must_use]
     pub const fn type_flag(&self) -> u8 {
         self.type_flag
+    }
+
+    /// Sets the file mode stored in the header.
+    pub const fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
+    }
+
+    /// Sets the numeric user id stored in the header.
+    pub const fn set_uid(&mut self, uid: u64) {
+        self.uid = uid;
+    }
+
+    /// Sets the numeric group id stored in the header.
+    pub const fn set_gid(&mut self, gid: u64) {
+        self.gid = gid;
+    }
+
+    /// Sets the number of data bytes that follow the header.
+    pub const fn set_size(&mut self, size: u64) {
+        self.stored_size = size;
+    }
+
+    /// Sets the modification time as seconds since the Unix epoch.
+    pub const fn set_mtime(&mut self, mtime: i64) {
+        self.mtime = mtime;
     }
     /// Link target, when present.
     pub fn link_name(&self) -> Option<Cow<'_, Path>> {
