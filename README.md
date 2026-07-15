@@ -53,8 +53,9 @@ reliable).
 None of this is a knock on tar-rs — it is a fine general-purpose library and
 this crate's header parsing draws from it (see acknowledgements). jdx-tar
 exists to own a narrower problem completely: **extracting real-world release
-tarballs, correctly and safely, with good UX hooks**. If you need to *create*
-archives or want an async API, use one of the crates above.
+tarballs, correctly and safely, with good UX hooks**. Archive creation is not
+implemented today, so use one of the crates above if you need it now. A
+well-tested PR adding synchronous, streaming tar writing would be welcome.
 
 ## Features
 
@@ -106,7 +107,8 @@ messages.
 
 ## Non-goals
 
-- **Writing archives** — extraction only.
+- **Writing archives today** — not implemented yet, but contributions are
+  welcome.
 - **Compression codecs** — hand this crate a decompressed `Read`.
 - **Async** — wrap it in `spawn_blocking` if you need to.
 - **Non-tar formats** — no zip, no 7z.
