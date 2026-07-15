@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/jdx-tar/badge.svg)](https://docs.rs/jdx-tar)
 [![CI](https://github.com/jdx/jdx-tar/actions/workflows/ci.yml/badge.svg)](https://github.com/jdx/jdx-tar/actions/workflows/ci.yml)
 
-Secure, synchronous, streaming tar **extraction** with complete GNU sparse
-support — including the PAX sparse formats that no other pure-Rust tar crate
-can extract.
+Synchronous, streaming tar extraction with support for all GNU sparse
+formats, including the PAX sparse formats that other pure-Rust tar crates
+cannot extract.
 
 ```rust
 use jdx_tar::{Archive, UnpackOptions};
@@ -18,26 +18,24 @@ println!("extracted {} files", summary.files);
 # Ok::<(), std::io::Error>(())
 ```
 
-Input only needs to implement `Read`, so decompression stays with the caller —
-wrap the file in your favorite gzip/xz/zstd decoder first.
+Input is anything that implements `Read`. Decompression is the caller's
+responsibility: wrap the file in a gzip/xz/zstd decoder first.
 
 ## Why another tar crate?
 
-Because [mise](https://github.com/jdx/mise) kept hitting release tarballs the
-existing Rust ecosystem cannot extract, and papered over it by shelling out to
-a system `tar` — which turned out to be its own portability roulette. This
-crate was built to delete that fallback.
+[mise](https://github.com/jdx/mise) kept hitting release tarballs that no
+Rust tar crate could extract, and papered over it by shelling out to a system
+`tar`. That fallback was unreliable: which `tar` you get depends on the
+platform and `PATH`, and GNU tar itself fails on some of these archives with
+`Unexpected EOF` (only bsdtar handles them all). This crate exists to delete
+that fallback.
 
-The concrete gap is **GNU sparse files in PAX format** (`GNU.sparse.*`
-extended headers, formats 0.0, 0.1, and 1.0). This is what modern GNU tar
-writes with `--sparse`, and it shows up in real release artifacts — for
-example projects shipping disk images, where a multi-gigabyte sparse file
-compresses to a few megabytes. Before this crate, a pure-Rust consumer
-hitting one of those archives had two options: extract a garbage
-`GNUSparseFile.0/<name>` file containing the raw sparse map, or spawn a
-subprocess and hope the right `tar` is on `PATH` (GNU tar itself fails on
-some of these archives with `Unexpected EOF`; only bsdtar/libarchive is
-reliable).
+The gap is GNU sparse files in PAX format (`GNU.sparse.*` extended headers,
+formats 0.0, 0.1, and 1.0), which is what modern GNU tar writes with
+`--sparse`. These appear in real release artifacts, typically disk images
+where a multi-gigabyte sparse file compresses to a few megabytes. The `tar`
+crate extracts these as a mangled `GNUSparseFile.0/<name>` file whose
+contents are the raw sparse map and packed data.
 
 |                                            | `jdx-tar` | [`tar`](https://crates.io/crates/tar) (tar-rs) | [`astral-tokio-tar`](https://crates.io/crates/astral-tokio-tar) | libarchive bindings | system `tar` subprocess |
 | ------------------------------------------ | --------- | ---------------------------------------------- | ---------------------------------------------------------------- | ------------------- | ----------------------- |
@@ -50,68 +48,59 @@ reliable).
 | Pure Rust, no C, `unsafe_code = "forbid"`  | ✅        | ✅                                             | ✅                                                                | ❌ (links C)        | n/a                     |
 | Writes archives                            | ❌        | ✅                                             | ✅                                                                | ✅                  | ✅                      |
 
-None of this is a knock on tar-rs — it is a fine general-purpose library and
-this crate's header parsing draws from it (see acknowledgements). jdx-tar
-exists to own a narrower problem completely: **extracting real-world release
-tarballs, correctly and safely, with good UX hooks**. Archive creation is not
-implemented today, so use one of the crates above if you need it now. A
-well-tested PR adding synchronous, streaming tar writing would be welcome.
+This crate's header parsing draws from the `tar` crate (see
+acknowledgements); use that or `astral-tokio-tar` if you need archive
+creation or an async API today. Archive writing is not implemented here yet,
+and a well-tested PR adding synchronous, streaming tar writing would be
+welcome.
 
 ## Features
 
-- **All four GNU sparse representations**: old GNU (type `S`, including
-  extended headers) and PAX 0.0, 0.1, and 1.0. Sparse semantics follow Go's
-  `archive/tar` and the GNU tar manual. Extraction creates real filesystem
-  holes (`seek` + `set_len`), so a 20 GiB-logical disk image lands on disk at
-  its actual data size.
-- **Logical entry model**: an `Entry` always reads as its logical contents
-  (holes return zeroes), with the data-extent map exposed via `sparse_map()`
-  for hole-aware writers. Sparse names are un-mangled — you see the real path,
-  never `GNUSparseFile.0/...`.
-- **Extraction options that compose correctly**: `strip_components` at any
-  depth, applied *after* long-name/PAX/sparse-name resolution;
-  `preserve_mtime`, `preserve_permissions`, `overwrite`.
-- **Progress and entry callbacks**: `on_progress` reports cumulative raw bytes
-  consumed from the input reader; `on_entry` fires before each logical entry
-  with its path, type, size, and sparseness.
-- **Extraction summaries**: `unpack` returns an `UnpackSummary` with counts of
-  files, directories, links, and sparse files, plus every skipped entry with a
-  typed `SkipReason` — nothing is silently dropped.
-- **Small and strict**: one dependency (`filetime`), `unsafe_code = "forbid"`,
-  fuzzed with `cargo-fuzz`.
+- All four GNU sparse representations: old GNU (type `S`, including extended
+  headers) and PAX 0.0, 0.1, and 1.0. Sparse semantics follow Go's
+  `archive/tar` and the GNU tar manual.
+- On Unix, sparse files are extracted with real filesystem holes, so a
+  20 GiB-logical disk image occupies only its data size on disk. On Windows,
+  extracted contents are identical but holes are not preserved, so sparse
+  files take their full logical size.
+- Entries read as their logical contents (holes read as zeroes), and the
+  data-extent map is available via `sparse_map()`. Paths are fully resolved
+  across long names, PAX overrides, and sparse name un-mangling, so you never
+  see `GNUSparseFile.0/...`.
+- `strip_components` at any depth, applied after name resolution, plus
+  `preserve_mtime`, `preserve_permissions`, and `overwrite`.
+- `on_progress` and `on_entry` callbacks. `unpack` returns an `UnpackSummary`
+  with counts and a typed `SkipReason` for every skipped entry.
+- One dependency (`filetime`), `unsafe_code = "forbid"`, fuzzed with
+  `cargo-fuzz`.
 
-## Security posture
+## Security
 
-Extraction is secure by default and **has no insecure mode**. The following
-are rejected: absolute paths, parent-directory traversal, writes through
-previously extracted symlinks, invalid header checksums, oversized PAX
-records, excessive sparse maps, and inconsistent or orphaned sparse metadata
-(e.g. `GNU.sparse.name` path-aliasing). Link *targets* may point outside the
-destination, but archive entries are never *written* outside it.
+Extraction is secure by default and has no insecure mode. Rejected: absolute
+paths, parent-directory traversal, writes through previously extracted
+symlinks, invalid header checksums, oversized PAX records, excessive sparse
+maps, and inconsistent or orphaned sparse metadata such as `GNU.sparse.name`
+path-aliasing. Link targets may point outside the destination; archive
+entries are never written outside it.
 
-As with every path-based extraction API, callers should ensure no untrusted
-local process can concurrently modify the destination tree during extraction.
+As with any path-based extraction API, callers should ensure no untrusted
+local process can modify the destination tree during extraction.
 
 ## Progress bars
 
-`on_progress` reports bytes consumed from the crate's input — the
-*decompressed* stream. That is a good activity signal, but for a bounded
-progress bar with an ETA you usually don't know the decompressed size up
-front. The recommended pattern is to meter your *compressed* source instead:
-wrap the `File` in a small counting reader **before** the decompression
-decoder, and use the archive's on-disk size as the bar's total. Because
-extraction streams — the unpacker pulls from the decoder, which pulls from the
-file — compressed-bytes-consumed is a monotonic, accurate measure of overall
-extraction progress. Use `on_entry` for "extracting `bin/tool`…" style status
-messages.
+`on_progress` reports bytes consumed from the input reader, which is the
+decompressed stream. Its total size usually isn't known up front, so it works
+as an activity signal but not a bounded bar. For a real progress bar, count
+bytes on the compressed file with a wrapping reader placed before the
+decoder, and use the file's size as the total. Extraction is streaming, so
+compressed bytes consumed track overall progress accurately. Use `on_entry`
+for per-file status messages.
 
 ## Non-goals
 
-- **Writing archives today** — not implemented yet, but contributions are
-  welcome.
-- **Compression codecs** — hand this crate a decompressed `Read`.
-- **Async** — wrap it in `spawn_blocking` if you need to.
-- **Non-tar formats** — no zip, no 7z.
+- Compression codecs: pass a decompressed `Read`.
+- Async: wrap calls in `spawn_blocking`.
+- Other formats: no zip, no 7z.
 
 ## Minimum supported Rust version
 
@@ -122,8 +111,8 @@ Rust 1.85 (edition 2024).
 Header layout and parsing details draw from the MIT/Apache-2.0 licensed
 [`tar`](https://crates.io/crates/tar) crate. Sparse-format semantics follow
 Go's `archive/tar` implementation and the GNU tar manual's *Storing Sparse
-Files* appendix. The PAX sparse metadata hardening checks were informed by the
-security work in
+Files* appendix. The PAX sparse metadata hardening checks were informed by
+the security work in
 [`astral-tokio-tar`](https://github.com/astral-sh/tokio-tar).
 
 ## License
