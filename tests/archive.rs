@@ -1,5 +1,13 @@
 use jdx_tar::{Archive, SparseSegment, UnpackOptions};
+#[cfg(unix)]
+use jdx_tar::{EntryType, SkipReason};
+#[cfg(unix)]
+use std::cell::RefCell;
 use std::io::{Cursor, Read};
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::rc::Rc;
 
 fn octal(field: &mut [u8], value: u64) {
     field.fill(0);
@@ -30,6 +38,14 @@ fn finish_header(block: &mut [u8; 512]) {
     let checksum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
     let sum = format!("{checksum:06o}\0 ");
     block[148..156].copy_from_slice(sum.as_bytes());
+}
+
+#[cfg(unix)]
+fn link_header(name: &str, target: &str, kind: u8) -> [u8; 512] {
+    let mut block = header(name, 0, kind);
+    block[157..157 + target.len()].copy_from_slice(target.as_bytes());
+    finish_header(&mut block);
+    block
 }
 
 #[allow(clippy::large_types_passed_by_value)]
@@ -216,6 +232,100 @@ fn secure_unpack_strips_after_sparse_name_resolution() {
         std::fs::metadata(temp.path().join("file")).unwrap().len(),
         4
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unpack_reports_callbacks_and_complete_summary() {
+    let mut tar = Vec::new();
+    append_entry(&mut tar, header("root/dir/", 0, b'5'), b"");
+    let dense = vec![b'x'; 70 * 1024];
+    append_entry(
+        &mut tar,
+        header("root/dir/dense", dense.len() as u64, b'0'),
+        &dense,
+    );
+
+    let (pax, pax_block) = pax_header(&[
+        ("GNU.sparse.major", "0"),
+        ("GNU.sparse.minor", "1"),
+        ("GNU.sparse.size", "12"),
+        ("GNU.sparse.map", "1,2,9,1"),
+    ]);
+    append_entry(&mut tar, pax_block, &pax);
+    append_entry(&mut tar, header("root/sparse", 3, b'0'), b"abc");
+    append_entry(&mut tar, link_header("root/link", "dir/dense", b'2'), b"");
+    append_entry(
+        &mut tar,
+        link_header("root/hard", "root/dir/dense", b'1'),
+        b"",
+    );
+    append_entry(&mut tar, header("root/device", 0, b'3'), b"");
+    append_entry(&mut tar, header("stripped", 0, b'0'), b"");
+    terminate(&mut tar);
+    let archive_len = tar.len() as u64;
+
+    let progress = Rc::new(RefCell::new(Vec::new()));
+    let entries = Rc::new(RefCell::new(Vec::new()));
+    let mut options = UnpackOptions::default();
+    options.strip_components = 1;
+    options.on_progress = Some(Box::new({
+        let progress = Rc::clone(&progress);
+        move |update| progress.borrow_mut().push(update.bytes_read)
+    }));
+    options.on_entry = Some(Box::new({
+        let entries = Rc::clone(&entries);
+        move |entry| {
+            entries.borrow_mut().push((
+                entry.path.clone(),
+                entry.entry_type,
+                entry.size,
+                entry.sparse,
+            ));
+        }
+    }));
+
+    let temp = tempfile::tempdir().unwrap();
+    let summary = Archive::new(Cursor::new(tar))
+        .unpack(temp.path(), &mut options)
+        .unwrap();
+
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.dirs, 1);
+    assert_eq!(summary.symlinks, 1);
+    assert_eq!(summary.hardlinks, 1);
+    assert_eq!(summary.sparse_files, 1);
+    assert_eq!(
+        summary
+            .skipped
+            .iter()
+            .map(|entry| (&entry.path, &entry.reason))
+            .collect::<Vec<_>>(),
+        [
+            (&PathBuf::from("root/device"), &SkipReason::UnsupportedType),
+            (&PathBuf::from("stripped"), &SkipReason::Stripped),
+        ]
+    );
+
+    let entries = entries.borrow();
+    assert_eq!(entries.len(), 7);
+    assert_eq!(
+        entries[0],
+        (PathBuf::from("root/dir"), EntryType::Directory, 0, false)
+    );
+    assert_eq!(entries[1].0, PathBuf::from("root/dir/dense"));
+    assert_eq!(entries[1].2, dense.len() as u64);
+    assert_eq!(
+        entries[2],
+        (PathBuf::from("root/sparse"), EntryType::File, 12, true)
+    );
+    assert_eq!(entries[6].0, PathBuf::from("stripped"));
+
+    let progress = progress.borrow();
+    assert!(!progress.is_empty());
+    assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(progress.last(), Some(&archive_len));
+    assert!(progress.iter().any(|bytes| *bytes >= 64 * 1024));
 }
 
 #[test]
