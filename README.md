@@ -23,9 +23,10 @@ wrap the file in your favorite gzip/xz/zstd decoder first.
 
 ## Why another tar crate?
 
-Because release tarballs in the wild contain things the existing Rust
-ecosystem cannot extract, and tools kept papering over that by shelling out to
-a system `tar` — which is its own portability roulette.
+Because [mise](https://github.com/jdx/mise) kept hitting release tarballs the
+existing Rust ecosystem cannot extract, and papered over it by shelling out to
+a system `tar` — which turned out to be its own portability roulette. This
+crate was built to delete that fallback.
 
 The concrete gap is **GNU sparse files in PAX format** (`GNU.sparse.*`
 extended headers, formats 0.0, 0.1, and 1.0). This is what modern GNU tar
