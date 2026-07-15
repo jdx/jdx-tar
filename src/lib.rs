@@ -1293,6 +1293,8 @@ fn apply_metadata(
     preserve_permissions: bool,
     preserve_mtime: bool,
 ) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = (mode, preserve_permissions);
     #[cfg(unix)]
     if preserve_permissions {
         use std::os::unix::fs::PermissionsExt;
