@@ -1275,7 +1275,7 @@ fn ensure_safe_parents(root: &Path, relative: &Path) -> Result<()> {
 
 fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if !overwrite => Ok(false),
+        Ok(_meta) if !overwrite => Ok(false),
         Ok(meta) if meta.is_dir() => Err(invalid("archive file collides with existing directory")),
         Ok(_) => {
             fs::remove_file(path)?;
