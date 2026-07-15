@@ -17,6 +17,7 @@ exclude = ["tests/fixtures/**"]
 filetime = "0.2.25"
 
 [dev-dependencies]
+flate2 = "1"
 tempfile = "3.15"
 
 [lints.rust]
@@ -25,4 +26,3 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
-

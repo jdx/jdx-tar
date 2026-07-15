@@ -1,4 +1,4 @@
 /target
 /fuzz/target
+/fuzz/corpus
 /tests/fixtures/generated
-

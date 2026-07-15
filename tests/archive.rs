@@ -91,6 +91,9 @@ fn reads_pax_sparse_1_0_as_logical_content() {
         ("GNU.sparse.minor", "0"),
         ("GNU.sparse.name", "root/sparse.bin"),
         ("GNU.sparse.realsize", "20"),
+        // Go's archive/tar writes the logical size here while retaining the
+        // packed size in the following tar header.
+        ("size", "20"),
     ]);
     append_entry(&mut tar, pax_block, &pax);
     let map = b"2\n2\n3\n15\n2\n";
@@ -245,4 +248,47 @@ fn rejects_traversal_checksum_and_symlink_escape() {
             .unpack(temp.path(), &mut UnpackOptions::default())
             .is_err()
     );
+}
+
+#[test]
+fn rejects_absolute_oversized_truncated_and_invalid_sparse_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let mut absolute = Vec::new();
+    append_entry(&mut absolute, header("/outside", 1, b'0'), b"x");
+    terminate(&mut absolute);
+    assert!(
+        Archive::new(Cursor::new(absolute))
+            .unpack(temp.path(), &mut UnpackOptions::default())
+            .is_err()
+    );
+
+    let mut oversized_metadata = header("PaxHeaders/huge", 1024 * 1024 + 1, b'x').to_vec();
+    oversized_metadata.resize(1536, 0);
+    let mut archive = Archive::new(Cursor::new(oversized_metadata));
+    assert!(archive.entries().unwrap().next().unwrap().is_err());
+
+    let mut invalid_sparse = Vec::new();
+    let (pax, pax_block) = pax_header(&[("GNU.sparse.size", "5"), ("GNU.sparse.map", "4,2")]);
+    append_entry(&mut invalid_sparse, pax_block, &pax);
+    append_entry(&mut invalid_sparse, header("sparse", 2, b'0'), b"xx");
+    terminate(&mut invalid_sparse);
+    let mut archive = Archive::new(Cursor::new(invalid_sparse));
+    assert!(archive.entries().unwrap().next().unwrap().is_err());
+
+    let mut orphaned_sparse_name = Vec::new();
+    let (pax, pax_block) = pax_header(&[("GNU.sparse.name", "alias")]);
+    append_entry(&mut orphaned_sparse_name, pax_block, &pax);
+    append_entry(&mut orphaned_sparse_name, header("real", 0, b'0'), b"");
+    terminate(&mut orphaned_sparse_name);
+    let mut archive = Archive::new(Cursor::new(orphaned_sparse_name));
+    assert!(archive.entries().unwrap().next().unwrap().is_err());
+
+    let mut truncated = header("file", 5, b'0').to_vec();
+    truncated.extend_from_slice(b"hi");
+    let mut archive = Archive::new(Cursor::new(truncated));
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    let mut body = Vec::new();
+    assert!(entry.read_to_end(&mut body).is_err());
 }

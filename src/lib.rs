@@ -342,7 +342,15 @@ impl<R: Read> Entries<'_, R> {
             }
             apply_pax_header(&mut header, &pax)?;
 
-            let physical_size = header.stored_size;
+            // GNU sparse PAX archives use the tar header's size for the packed
+            // body. Some writers (notably Go's archive/tar) also emit a PAX
+            // `size` record containing the logical sparse size.
+            let physical_size = if pax.iter().any(|(key, _)| key.starts_with("GNU.sparse.")) {
+                size
+            } else {
+                header.stored_size
+            };
+            header.stored_size = physical_size;
             let generation;
             {
                 let mut state = self.state.borrow_mut();
