@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.0.2](https://github.com/jdx/jdx-tar/compare/v0.0.1...v0.0.2) - 2026-07-15
+## [1.0.0](https://github.com/jdx/jdx-tar/compare/v0.0.1...v1.0.0) - 2026-07-15
 
 ### Other
 
@@ -29,4 +29,3 @@
 - Streaming ustar, GNU, and PAX reader.
 - GNU sparse 0.0, 0.1, 1.0, and old GNU sparse extraction.
 - Secure extraction options, progress hooks, and extraction summaries.
-

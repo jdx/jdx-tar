@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "jdx-tar"
-version = "0.0.2"
+version = "1.0.0"
 dependencies = [
  "filetime",
  "flate2",
