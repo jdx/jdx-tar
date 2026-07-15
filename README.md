@@ -67,6 +67,9 @@ welcome.
   data-extent map is available via `sparse_map()`. Paths are fully resolved
   across long names, PAX overrides, and sparse name un-mangling, so you never
   see `GNUSparseFile.0/...`.
+- Individual entries can be securely extracted with `Entry::unpack_in`, which
+  lets callers inspect or skip entries while retaining the same path and
+  symlink protections as whole-archive extraction.
 - `strip_components` at any depth, applied after name resolution, plus
   `preserve_mtime`, `preserve_permissions`, and `overwrite`.
 - `on_progress` and `on_entry` callbacks. `unpack` returns an `UnpackSummary`

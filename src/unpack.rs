@@ -1,4 +1,4 @@
-use super::{Archive, EntryType, Result, invalid};
+use super::{Archive, Entry, EntryType, Result, invalid};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -280,6 +280,160 @@ pub(super) fn unpack_archive<R: Read>(
         apply_metadata(&path, mode, mtime, preserve_permissions, preserve_mtime)?;
     }
     progress.boundary(archive.state.borrow().raw_bytes);
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn unpack_entry<R: Read>(
+    entry: &mut Entry<R>,
+    dest: &Path,
+    opts: &mut UnpackOptions,
+) -> Result<UnpackSummary> {
+    fs::create_dir_all(dest)?;
+    if fs::symlink_metadata(dest)?.file_type().is_symlink() {
+        return Err(invalid("destination may not be a symlink"));
+    }
+    let root = fs::canonicalize(dest)?;
+    let original = entry.path()?.into_owned();
+    if let Some(callback) = opts.on_entry.as_mut() {
+        callback(&EntryInfo {
+            path: original.clone(),
+            entry_type: entry.kind,
+            size: entry.logical_size,
+            sparse: entry.sparse.is_some(),
+        });
+    }
+    let mut summary = UnpackSummary::default();
+    let mut progress = ProgressReporter {
+        callback: &mut opts.on_progress,
+        last: 0,
+    };
+    progress.boundary(entry.bytes_read());
+    let Some(relative) = secure_relative_path(&original, opts.strip_components)? else {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::Stripped,
+        });
+        return Ok(summary);
+    };
+    if is_reserved_path(&relative) {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::ReservedName,
+        });
+        return Ok(summary);
+    }
+    let output = root.join(&relative);
+    ensure_safe_parents(&root, &relative)?;
+    match entry.kind {
+        EntryType::Directory => {
+            if output.exists() && fs::symlink_metadata(&output)?.file_type().is_symlink() {
+                return Err(invalid("archive directory collides with symlink"));
+            }
+            fs::create_dir_all(&output)?;
+            apply_metadata(
+                &output,
+                entry.header.mode,
+                entry.header.mtime,
+                opts.preserve_permissions,
+                opts.preserve_mtime,
+            )?;
+            summary.dirs = 1;
+        }
+        EntryType::File => {
+            if !prepare_output(&output, opts.overwrite)? {
+                summary.skipped.push(SkippedEntry {
+                    path: original,
+                    reason: SkipReason::Exists,
+                });
+                return Ok(summary);
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?;
+            if entry.sparse.is_some() {
+                entry.copy_sparse_to(&mut file, &mut progress)?;
+                summary.sparse_files = 1;
+            } else {
+                let mut buf = vec![0_u8; 64 * 1024];
+                loop {
+                    let n = entry.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..n])?;
+                    progress.update(entry.bytes_read());
+                }
+            }
+            apply_metadata(
+                &output,
+                entry.header.mode,
+                entry.header.mtime,
+                opts.preserve_permissions,
+                opts.preserve_mtime,
+            )?;
+            summary.files = 1;
+        }
+        EntryType::Symlink => {
+            if !prepare_output(&output, opts.overwrite)? {
+                summary.skipped.push(SkippedEntry {
+                    path: original,
+                    reason: SkipReason::Exists,
+                });
+                return Ok(summary);
+            }
+            let target = entry
+                .header
+                .link_name()
+                .ok_or_else(|| invalid("symlink lacks target"))?;
+            match create_symlink(&target, &output) {
+                Ok(()) => summary.symlinks = 1,
+                Err(err)
+                    if cfg!(windows)
+                        && matches!(
+                            err.kind(),
+                            ErrorKind::PermissionDenied | ErrorKind::Unsupported
+                        ) =>
+                {
+                    summary.skipped.push(SkippedEntry {
+                        path: original,
+                        reason: SkipReason::SymlinkUnavailable,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        EntryType::Hardlink => {
+            if !prepare_output(&output, opts.overwrite)? {
+                summary.skipped.push(SkippedEntry {
+                    path: original,
+                    reason: SkipReason::Exists,
+                });
+                return Ok(summary);
+            }
+            let target = entry
+                .header
+                .link_name()
+                .ok_or_else(|| invalid("hardlink lacks target"))?;
+            let target_relative = secure_relative_path(&target, opts.strip_components)?
+                .ok_or_else(|| invalid("hardlink target was stripped away"))?;
+            ensure_safe_parents(&root, &target_relative)?;
+            let source = root.join(target_relative);
+            let metadata = fs::symlink_metadata(&source)
+                .map_err(|_| invalid("hardlink target does not exist within destination"))?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid("hardlink target may not be a symlink"));
+            }
+            fs::hard_link(source, output)?;
+            summary.hardlinks = 1;
+        }
+        _ => summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::UnsupportedType,
+        }),
+    }
+    progress.boundary(entry.bytes_read());
     Ok(summary)
 }
 
