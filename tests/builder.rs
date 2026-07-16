@@ -88,6 +88,13 @@ fn writes_long_paths_and_rejects_short_data() {
         .append_data(&mut header, "short", &b"x"[..])
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    let mut next = Header::new_gnu(EntryType::File);
+    assert!(
+        builder
+            .append_data(&mut next, "next", std::io::empty())
+            .is_err()
+    );
+    assert!(builder.finish().is_err());
 }
 
 #[test]

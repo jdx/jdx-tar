@@ -13,6 +13,7 @@ const LINK_LEN: usize = 100;
 pub struct Builder<W: Write> {
     inner: W,
     finished: bool,
+    poisoned: bool,
 }
 
 impl<W: Write> Builder<W> {
@@ -21,6 +22,7 @@ impl<W: Write> Builder<W> {
         Self {
             inner,
             finished: false,
+            poisoned: false,
         }
     }
 
@@ -43,10 +45,11 @@ impl<W: Write> Builder<W> {
         if path.is_empty() {
             return Err(invalid("tar entry path is empty"));
         }
+        header.path.clone_from(&path);
+        encode_header(header)?;
         if path.len() > NAME_LEN {
             self.append_long_record(b'L', &path)?;
         }
-        header.path = path;
         self.append_resolved(header, data)
     }
 
@@ -79,15 +82,20 @@ impl<W: Write> Builder<W> {
         if target.is_empty() {
             return Err(invalid("tar link target is empty"));
         }
-        if target.len() > LINK_LEN {
-            self.append_long_record(b'K', &target)?;
+        header.link_name = Some(target);
+        header.stored_size = 0;
+        header.path.clone_from(&path);
+        encode_header(header)?;
+        if let Some(target) = header
+            .link_name
+            .as_deref()
+            .filter(|target| target.len() > LINK_LEN)
+        {
+            self.append_long_record(b'K', target)?;
         }
         if path.len() > NAME_LEN {
             self.append_long_record(b'L', &path)?;
         }
-        header.link_name = Some(target);
-        header.stored_size = 0;
-        header.path = path;
         self.append_resolved(header, io::empty())
     }
 
@@ -97,9 +105,18 @@ impl<W: Write> Builder<W> {
     ///
     /// Returns an error when writing or flushing the wrapped writer fails.
     pub fn finish(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(invalid("cannot finish a poisoned tar archive"));
+        }
         if !self.finished {
-            self.inner.write_all(&[0_u8; BLOCK_LEN * 2])?;
-            self.inner.flush()?;
+            if let Err(error) = self
+                .inner
+                .write_all(&[0_u8; BLOCK_LEN * 2])
+                .and_then(|()| self.inner.flush())
+            {
+                self.poisoned = true;
+                return Err(error);
+            }
             self.finished = true;
         }
         Ok(())
@@ -131,24 +148,33 @@ impl<W: Write> Builder<W> {
     }
 
     fn append_resolved<R: Read>(&mut self, header: &Header, mut data: R) -> Result<()> {
+        if self.poisoned {
+            return Err(invalid("cannot append to a poisoned tar archive"));
+        }
         if self.finished {
             return Err(invalid("cannot append to a finished tar archive"));
         }
         let block = encode_header(header)?;
-        self.inner.write_all(&block)?;
-        let copied = io::copy(&mut data.by_ref().take(header.stored_size), &mut self.inner)?;
-        if copied != header.stored_size {
-            return Err(io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "tar entry data is shorter than its header size",
-            ));
+        let result = (|| {
+            self.inner.write_all(&block)?;
+            let copied = io::copy(&mut data.by_ref().take(header.stored_size), &mut self.inner)?;
+            if copied != header.stored_size {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "tar entry data is shorter than its header size",
+                ));
+            }
+            let padding = (512 - header.stored_size % 512) % 512;
+            if padding != 0 {
+                self.inner
+                    .write_all(&[0_u8; BLOCK_LEN][..padding as usize])?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
         }
-        let padding = (512 - header.stored_size % 512) % 512;
-        if padding != 0 {
-            self.inner
-                .write_all(&[0_u8; BLOCK_LEN][..padding as usize])?;
-        }
-        Ok(())
+        result
     }
 }
 
