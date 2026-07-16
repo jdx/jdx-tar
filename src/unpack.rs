@@ -100,6 +100,73 @@ impl Default for UnpackOptions {
     }
 }
 
+/// Stateful secure extractor for callers that inspect or skip individual
+/// entries before unpacking them.
+///
+/// Call [`Self::finish`] after the final entry so directory permissions and
+/// modification times are applied after their children have been written.
+#[must_use = "call finish() to apply deferred directory metadata"]
+pub struct EntryUnpacker<'a> {
+    root: PathBuf,
+    opts: &'a mut UnpackOptions,
+    deferred_dirs: Vec<(PathBuf, u32, i64)>,
+}
+
+impl<'a> EntryUnpacker<'a> {
+    /// Creates a per-entry extractor rooted at `dest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination cannot be created or resolved,
+    /// or when it is itself a symbolic link.
+    pub fn new<P: AsRef<Path>>(dest: P, opts: &'a mut UnpackOptions) -> Result<Self> {
+        let dest = dest.as_ref();
+        fs::create_dir_all(dest)?;
+        if fs::symlink_metadata(dest)?.file_type().is_symlink() {
+            return Err(invalid("destination may not be a symlink"));
+        }
+        Ok(Self {
+            root: fs::canonicalize(dest)?,
+            opts,
+            deferred_dirs: Vec::new(),
+        })
+    }
+
+    /// Securely extracts one entry beneath the configured destination.
+    ///
+    /// Entries may be inspected and omitted by the caller before invoking
+    /// this method. Absolute paths, traversal, and writes through symlinked
+    /// parents are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe path, malformed link target, truncated
+    /// data, callback-independent I/O failure, or filesystem extraction
+    /// failure.
+    pub fn unpack<R: Read>(&mut self, entry: &mut Entry<R>) -> Result<UnpackSummary> {
+        unpack_entry(entry, &self.root, self.opts, &mut self.deferred_dirs)
+    }
+
+    /// Applies deferred directory metadata and completes extraction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when directory permissions or modification times
+    /// cannot be restored.
+    pub fn finish(self) -> Result<()> {
+        for (path, mode, mtime) in self.deferred_dirs.into_iter().rev() {
+            apply_metadata(
+                &path,
+                mode,
+                mtime,
+                self.opts.preserve_permissions,
+                self.opts.preserve_mtime,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct ProgressReporter<'a> {
     callback: &'a mut Option<ProgressCallback>,
     last: u64,
@@ -286,14 +353,10 @@ pub(super) fn unpack_archive<R: Read>(
 #[allow(clippy::too_many_lines)]
 pub(super) fn unpack_entry<R: Read>(
     entry: &mut Entry<R>,
-    dest: &Path,
+    root: &Path,
     opts: &mut UnpackOptions,
+    deferred_dirs: &mut Vec<(PathBuf, u32, i64)>,
 ) -> Result<UnpackSummary> {
-    fs::create_dir_all(dest)?;
-    if fs::symlink_metadata(dest)?.file_type().is_symlink() {
-        return Err(invalid("destination may not be a symlink"));
-    }
-    let root = fs::canonicalize(dest)?;
     let original = entry.path()?.into_owned();
     if let Some(callback) = opts.on_entry.as_mut() {
         callback(&EntryInfo {
@@ -324,20 +387,14 @@ pub(super) fn unpack_entry<R: Read>(
         return Ok(summary);
     }
     let output = root.join(&relative);
-    ensure_safe_parents(&root, &relative)?;
+    ensure_safe_parents(root, &relative)?;
     match entry.kind {
         EntryType::Directory => {
             if output.exists() && fs::symlink_metadata(&output)?.file_type().is_symlink() {
                 return Err(invalid("archive directory collides with symlink"));
             }
             fs::create_dir_all(&output)?;
-            apply_metadata(
-                &output,
-                entry.header.mode,
-                entry.header.mtime,
-                opts.preserve_permissions,
-                opts.preserve_mtime,
-            )?;
+            deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
             summary.dirs = 1;
         }
         EntryType::File => {
@@ -418,7 +475,7 @@ pub(super) fn unpack_entry<R: Read>(
                 .ok_or_else(|| invalid("hardlink lacks target"))?;
             let target_relative = secure_relative_path(&target, opts.strip_components)?
                 .ok_or_else(|| invalid("hardlink target was stripped away"))?;
-            ensure_safe_parents(&root, &target_relative)?;
+            ensure_safe_parents(root, &target_relative)?;
             let source = root.join(target_relative);
             let metadata = fs::symlink_metadata(&source)
                 .map_err(|_| invalid("hardlink target does not exist within destination"))?;

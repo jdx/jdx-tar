@@ -1,4 +1,4 @@
-use jdx_tar::{Archive, SparseSegment, UnpackOptions};
+use jdx_tar::{Archive, EntryUnpacker, SparseSegment, UnpackOptions};
 #[cfg(unix)]
 use jdx_tar::{EntryType, SkipReason};
 #[cfg(unix)]
@@ -119,7 +119,9 @@ fn securely_unpacks_selected_entries() {
     let mut tool = entries.next().unwrap().unwrap();
     let mut options = UnpackOptions::default();
     options.strip_components = 1;
-    let summary = tool.unpack_in_with(temp.path(), &mut options).unwrap();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    let summary = unpacker.unpack(&mut tool).unwrap();
+    unpacker.finish().unwrap();
     assert_eq!(summary.files, 1);
     assert_eq!(std::fs::read(temp.path().join("tool")).unwrap(), b"hello");
     assert!(!temp.path().join("whiteout").exists());
@@ -141,7 +143,10 @@ fn entry_unpack_handles_sparse_data_and_rejects_traversal() {
     let temp = tempfile::tempdir().unwrap();
     let mut archive = Archive::new(Cursor::new(sparse));
     let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
-    let summary = entry.unpack_in(temp.path()).unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    let summary = unpacker.unpack(&mut entry).unwrap();
+    unpacker.finish().unwrap();
     assert_eq!(summary.files, 1);
     assert_eq!(summary.sparse_files, 1);
     assert_eq!(
@@ -154,7 +159,9 @@ fn entry_unpack_handles_sparse_data_and_rejects_traversal() {
     terminate(&mut traversal);
     let mut archive = Archive::new(Cursor::new(traversal));
     let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
-    assert!(entry.unpack_in(temp.path()).is_err());
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    assert!(unpacker.unpack(&mut entry).is_err());
 }
 
 #[cfg(unix)]
@@ -169,8 +176,40 @@ fn entry_unpack_rejects_symlinked_parent() {
     terminate(&mut tar);
     let mut archive = Archive::new(Cursor::new(tar));
     let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
-    assert!(entry.unpack_in(temp.path()).is_err());
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    assert!(unpacker.unpack(&mut entry).is_err());
     assert!(!outside.path().join("escape").exists());
+}
+
+#[test]
+fn entry_unpacker_defers_directory_metadata_until_finish() {
+    let mut tar = Vec::new();
+    append_entry(&mut tar, header("dir/", 0, b'5'), b"");
+    append_entry(&mut tar, header("dir/file", 1, b'0'), b"x");
+    terminate(&mut tar);
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    unpacker
+        .unpack(&mut entries.next().unwrap().unwrap())
+        .unwrap();
+    unpacker
+        .unpack(&mut entries.next().unwrap().unwrap())
+        .unwrap();
+    unpacker.finish().unwrap();
+
+    let modified = std::fs::metadata(temp.path().join("dir"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(modified, 1_700_000_000);
 }
 
 #[test]

@@ -21,10 +21,10 @@ use format::{
     push_sparse_pair, trim_metadata, validate_sparse, verify_checksum,
 };
 pub use unpack::{
-    EntryCallback, EntryInfo, Progress, ProgressCallback, SkipReason, SkippedEntry, UnpackOptions,
-    UnpackSummary,
+    EntryCallback, EntryInfo, EntryUnpacker, Progress, ProgressCallback, SkipReason, SkippedEntry,
+    UnpackOptions, UnpackSummary,
 };
-use unpack::{ProgressReporter, unpack_archive, unpack_entry};
+use unpack::{ProgressReporter, unpack_archive};
 
 const BLOCK: u64 = 512;
 const MAX_PAX_SIZE: u64 = 1024 * 1024;
@@ -586,38 +586,6 @@ impl<R: Read> Entry<R> {
     #[must_use]
     pub fn bytes_read(&self) -> u64 {
         self.state.borrow().raw_bytes
-    }
-
-    /// Securely extracts this entry beneath `dest` using default options.
-    ///
-    /// The resolved archive path is validated exactly as it is during
-    /// [`Archive::unpack`]. Absolute paths, traversal, and writes through
-    /// symlinked parents are rejected.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unsafe path, malformed link target, truncated
-    /// data, or filesystem extraction failure.
-    pub fn unpack_in<P: AsRef<Path>>(&mut self, dest: P) -> Result<UnpackSummary> {
-        self.unpack_in_with(dest, &mut UnpackOptions::default())
-    }
-
-    /// Securely extracts this entry beneath `dest` using `opts`.
-    ///
-    /// This supports callers that must inspect or skip individual entries,
-    /// such as OCI layer processors handling whiteouts between entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unsafe path, malformed link target, truncated
-    /// data, callback-independent I/O failure, or filesystem extraction
-    /// failure.
-    pub fn unpack_in_with<P: AsRef<Path>>(
-        &mut self,
-        dest: P,
-        opts: &mut UnpackOptions,
-    ) -> Result<UnpackSummary> {
-        unpack_entry(self, dest.as_ref(), opts)
     }
 
     fn read_physical(&mut self, buf: &mut [u8]) -> Result<usize> {
