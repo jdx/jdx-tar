@@ -1,4 +1,4 @@
-use jdx_tar::{Archive, SparseSegment, UnpackOptions};
+use jdx_tar::{Archive, EntryUnpacker, SparseSegment, UnpackOptions};
 #[cfg(unix)]
 use jdx_tar::{EntryType, SkipReason};
 #[cfg(unix)]
@@ -97,6 +97,119 @@ fn reads_dense_and_pax_path() {
     entry.read_to_string(&mut body).unwrap();
     assert_eq!(body, "hello");
     assert!(entries.next().is_none());
+}
+
+#[test]
+fn securely_unpacks_selected_entries() {
+    let mut tar = Vec::new();
+    append_entry(&mut tar, header("root/whiteout", 3, b'0'), b"old");
+    append_entry(&mut tar, header("root/tool", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+
+    let skipped = entries.next().unwrap().unwrap();
+    assert_eq!(
+        skipped.path().unwrap().as_ref(),
+        std::path::Path::new("root/whiteout")
+    );
+
+    let mut tool = entries.next().unwrap().unwrap();
+    let mut options = UnpackOptions::default();
+    options.strip_components = 1;
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    let summary = unpacker.unpack(&mut tool).unwrap();
+    unpacker.finish().unwrap();
+    assert_eq!(summary.files, 1);
+    assert_eq!(std::fs::read(temp.path().join("tool")).unwrap(), b"hello");
+    assert!(!temp.path().join("whiteout").exists());
+}
+
+#[test]
+fn entry_unpack_handles_sparse_data_and_rejects_traversal() {
+    let mut sparse = Vec::new();
+    let (pax, pax_block) = pax_header(&[
+        ("GNU.sparse.major", "0"),
+        ("GNU.sparse.minor", "1"),
+        ("GNU.sparse.size", "12"),
+        ("GNU.sparse.map", "1,2,9,1"),
+    ]);
+    append_entry(&mut sparse, pax_block, &pax);
+    append_entry(&mut sparse, header("root/sparse", 3, b'0'), b"abc");
+    terminate(&mut sparse);
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut archive = Archive::new(Cursor::new(sparse));
+    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    let summary = unpacker.unpack(&mut entry).unwrap();
+    unpacker.finish().unwrap();
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.sparse_files, 1);
+    assert_eq!(
+        std::fs::read(temp.path().join("root/sparse")).unwrap(),
+        b"\0ab\0\0\0\0\0\0c\0\0"
+    );
+
+    let mut traversal = Vec::new();
+    append_entry(&mut traversal, header("../outside", 1, b'0'), b"x");
+    terminate(&mut traversal);
+    let mut archive = Archive::new(Cursor::new(traversal));
+    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    assert!(unpacker.unpack(&mut entry).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn entry_unpack_rejects_symlinked_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+
+    let mut tar = Vec::new();
+    append_entry(&mut tar, header("link/escape", 1, b'0'), b"x");
+    terminate(&mut tar);
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    assert!(unpacker.unpack(&mut entry).is_err());
+    assert!(!outside.path().join("escape").exists());
+}
+
+#[test]
+fn entry_unpacker_defers_directory_metadata_until_finish() {
+    let mut tar = Vec::new();
+    append_entry(&mut tar, header("dir/", 0, b'5'), b"");
+    append_entry(&mut tar, header("dir/file", 1, b'0'), b"x");
+    terminate(&mut tar);
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut options = UnpackOptions::default();
+    let mut unpacker = EntryUnpacker::new(temp.path(), &mut options).unwrap();
+    unpacker
+        .unpack(&mut entries.next().unwrap().unwrap())
+        .unwrap();
+    unpacker
+        .unpack(&mut entries.next().unwrap().unwrap())
+        .unwrap();
+    unpacker.finish().unwrap();
+
+    let modified = std::fs::metadata(temp.path().join("dir"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(modified, 1_700_000_000);
 }
 
 #[test]

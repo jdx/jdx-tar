@@ -21,8 +21,8 @@ use format::{
     push_sparse_pair, trim_metadata, validate_sparse, verify_checksum,
 };
 pub use unpack::{
-    EntryCallback, EntryInfo, Progress, ProgressCallback, SkipReason, SkippedEntry, UnpackOptions,
-    UnpackSummary,
+    EntryCallback, EntryInfo, EntryUnpacker, Progress, ProgressCallback, SkipReason, SkippedEntry,
+    UnpackOptions, UnpackSummary,
 };
 use unpack::{ProgressReporter, unpack_archive};
 
