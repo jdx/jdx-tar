@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/jdx/jdx-tar/compare/v1.0.0...v1.1.0) - 2026-07-16
+
+### Added
+
+- add streaming tar writer ([#11](https://github.com/jdx/jdx-tar/pull/11))
+- add secure per-entry extraction ([#10](https://github.com/jdx/jdx-tar/pull/10))
+
 ## [1.0.0](https://github.com/jdx/jdx-tar/compare/v0.0.1...v1.0.0) - 2026-07-15
 
 ### Other
