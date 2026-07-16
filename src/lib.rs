@@ -29,7 +29,7 @@ pub use unpack::{
 use unpack::{ProgressReporter, unpack_archive};
 
 const BLOCK: u64 = 512;
-const MAX_PAX_SIZE: u64 = 1024 * 1024;
+const MAX_METADATA_SIZE: u64 = 1024 * 1024;
 const MAX_SPARSE_SEGMENTS: usize = 1_000_000;
 
 /// The crate's result type.
@@ -369,7 +369,7 @@ impl<R: Read> Entries<'_, R> {
             let size = header.stored_size;
 
             if matches!(flag, b'x' | b'g' | b'L' | b'K') {
-                if size > MAX_PAX_SIZE {
+                if size > MAX_METADATA_SIZE {
                     return Err(error(
                         ErrorKind::InvalidData,
                         "tar metadata exceeds 1 MiB limit",

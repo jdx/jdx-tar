@@ -1,4 +1,4 @@
-use super::{EntryType, Header, Result};
+use super::{EntryType, Header, MAX_METADATA_SIZE, Result};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 
@@ -46,6 +46,9 @@ impl<W: Write> Builder<W> {
             return Err(invalid("tar entry path is empty"));
         }
         header.path.clone_from(&path);
+        if path.len() > NAME_LEN {
+            long_record_size(&path)?;
+        }
         encode_header(header)?;
         if path.len() > NAME_LEN {
             self.append_long_record(b'L', &path)?;
@@ -85,6 +88,16 @@ impl<W: Write> Builder<W> {
         header.link_name = Some(target);
         header.stored_size = 0;
         header.path.clone_from(&path);
+        if let Some(target) = header
+            .link_name
+            .as_deref()
+            .filter(|target| target.len() > LINK_LEN)
+        {
+            long_record_size(target)?;
+        }
+        if path.len() > NAME_LEN {
+            long_record_size(&path)?;
+        }
         encode_header(header)?;
         if let Some(target) = header
             .link_name
@@ -133,11 +146,7 @@ impl<W: Write> Builder<W> {
     }
 
     fn append_long_record(&mut self, flag: u8, value: &[u8]) -> Result<()> {
-        let size = value
-            .len()
-            .checked_add(1)
-            .and_then(|size| u64::try_from(size).ok())
-            .ok_or_else(|| invalid("GNU long-name record is too large"))?;
+        let size = long_record_size(value)?;
         let mut header = Header::new_gnu(EntryType::Other(flag));
         header.path = b"././@LongLink".to_vec();
         header.mode = 0o644;
@@ -176,6 +185,18 @@ impl<W: Write> Builder<W> {
         }
         result
     }
+}
+
+fn long_record_size(value: &[u8]) -> Result<u64> {
+    let size = value
+        .len()
+        .checked_add(1)
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| invalid("GNU long-name record is too large"))?;
+    if size > MAX_METADATA_SIZE {
+        return Err(invalid("GNU long-name record exceeds 1 MiB limit"));
+    }
+    Ok(size)
 }
 
 fn encode_header(header: &Header) -> Result<[u8; BLOCK_LEN]> {

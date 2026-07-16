@@ -138,3 +138,41 @@ fn invalid_link_does_not_write_partial_metadata() {
     );
     assert!(entries.next().is_none());
 }
+
+#[test]
+fn oversized_long_records_do_not_write_partial_metadata() {
+    let oversized = "x".repeat(1024 * 1024);
+    let mut builder = Builder::new(Vec::new());
+
+    let mut file = Header::new_gnu(EntryType::File);
+    let error = builder
+        .append_data(&mut file, &oversized, std::io::empty())
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let mut link = Header::new_gnu(EntryType::Symlink);
+    let long_target = "t".repeat(101);
+    let error = builder
+        .append_link(&mut link, &oversized, &long_target)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let mut link = Header::new_gnu(EntryType::Symlink);
+    let error = builder
+        .append_link(&mut link, "oversized-target", &oversized)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let mut valid = Header::new_gnu(EntryType::File);
+    valid.set_size(2);
+    builder.append_data(&mut valid, "ok", &b"ok"[..]).unwrap();
+    let bytes = builder.into_inner().unwrap();
+
+    let mut archive = Archive::new(Cursor::new(bytes));
+    let mut entries = archive.entries().unwrap();
+    assert_eq!(
+        entries.next().unwrap().unwrap().path().unwrap().as_ref(),
+        std::path::Path::new("ok")
+    );
+    assert!(entries.next().is_none());
+}
