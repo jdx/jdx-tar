@@ -71,6 +71,10 @@ impl<W: Write> Builder<W> {
         ) {
             return Err(invalid("append_link requires a symlink or hardlink header"));
         }
+        let path = path_bytes(path.as_ref());
+        if path.is_empty() {
+            return Err(invalid("tar entry path is empty"));
+        }
         let target = path_bytes(target.as_ref());
         if target.is_empty() {
             return Err(invalid("tar link target is empty"));
@@ -78,9 +82,13 @@ impl<W: Write> Builder<W> {
         if target.len() > LINK_LEN {
             self.append_long_record(b'K', &target)?;
         }
+        if path.len() > NAME_LEN {
+            self.append_long_record(b'L', &path)?;
+        }
         header.link_name = Some(target);
         header.stored_size = 0;
-        self.append_data(header, path, io::empty())
+        header.path = path;
+        self.append_resolved(header, io::empty())
     }
 
     /// Writes the two zero blocks that terminate a tar archive.

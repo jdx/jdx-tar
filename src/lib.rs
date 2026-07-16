@@ -182,6 +182,7 @@ impl Header {
     pub const fn set_mtime(&mut self, mtime: i64) {
         self.mtime = mtime;
     }
+
     /// Link target, when present.
     pub fn link_name(&self) -> Option<Cow<'_, Path>> {
         self.link_name.as_deref().map(bytes_to_path)

@@ -110,3 +110,24 @@ fn output_is_compatible_with_tar_rs() {
     entry.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "backend");
 }
+
+#[test]
+fn invalid_link_does_not_write_partial_metadata() {
+    let mut builder = Builder::new(Vec::new());
+    let mut link = Header::new_gnu(EntryType::Symlink);
+    let long_target = "target/".repeat(20);
+    assert!(builder.append_link(&mut link, "", long_target).is_err());
+
+    let mut file = Header::new_gnu(EntryType::File);
+    file.set_size(2);
+    builder.append_data(&mut file, "ok", &b"ok"[..]).unwrap();
+    let bytes = builder.into_inner().unwrap();
+
+    let mut archive = Archive::new(Cursor::new(bytes));
+    let mut entries = archive.entries().unwrap();
+    assert_eq!(
+        entries.next().unwrap().unwrap().path().unwrap().as_ref(),
+        std::path::Path::new("ok")
+    );
+    assert!(entries.next().is_none());
+}
