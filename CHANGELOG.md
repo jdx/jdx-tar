@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/jdx/jdx-tar/compare/v1.1.0...v1.1.1) - 2026-07-24
+
+### Other
+
+- *(deps)* update actions/checkout digest to 3d3c42e ([#15](https://github.com/jdx/jdx-tar/pull/15))
+- *(deps)* pin dependencies ([#13](https://github.com/jdx/jdx-tar/pull/13))
+- *(deps)* update actions/checkout action to v7 ([#14](https://github.com/jdx/jdx-tar/pull/14))
+
 ## [1.1.0](https://github.com/jdx/jdx-tar/compare/v1.0.0...v1.1.0) - 2026-07-16
 
 ### Added
