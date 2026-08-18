@@ -11,3 +11,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run read_unpack -- -runs=100000
+        env:
+          RUSTC_BOOTSTRAP: 1
