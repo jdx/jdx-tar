@@ -271,6 +271,15 @@ pub(super) fn unpack_archive<R: Read>(
             &output,
             opts.overwrite,
         )?;
+        if entry.kind == EntryType::File
+            && entry.sparse.is_some()
+            && entry.logical_size > i64::MAX as u64
+            && (opts.overwrite || fs::symlink_metadata(&output).is_err())
+        {
+            return Err(invalid(
+                "sparse output length exceeds the filesystem offset range",
+            ));
+        }
         ensure_safe_parents(&root, &relative)?;
         match entry.kind {
             EntryType::Directory => {
@@ -464,6 +473,15 @@ pub(super) fn unpack_entry<R: Read>(
         &output,
         opts.overwrite,
     )?;
+    if entry.kind == EntryType::File
+        && entry.sparse.is_some()
+        && entry.logical_size > i64::MAX as u64
+        && (opts.overwrite || fs::symlink_metadata(&output).is_err())
+    {
+        return Err(invalid(
+            "sparse output length exceeds the filesystem offset range",
+        ));
+    }
     ensure_safe_parents(root, &relative)?;
     match entry.kind {
         EntryType::Directory => {
