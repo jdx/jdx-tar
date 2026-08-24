@@ -675,6 +675,20 @@ impl<R: Read> Entries<'_, R> {
         let major = pax_text_checked(pax, "GNU.sparse.major")?;
         let minor = pax_text_checked(pax, "GNU.sparse.minor")?;
         if major == Some("1") && minor == Some("0") {
+            if pax.iter().any(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "GNU.sparse.map"
+                        | "GNU.sparse.numblocks"
+                        | "GNU.sparse.offset"
+                        | "GNU.sparse.numbytes"
+                        | "GNU.sparse.size"
+                )
+            }) {
+                return Err(invalid(
+                    "GNU sparse 1.0 metadata mixes sparse representations",
+                ));
+            }
             let logical = pax_u64_checked(pax, "GNU.sparse.realsize")?
                 .ok_or_else(|| invalid("PAX sparse 1.0 lacks GNU.sparse.realsize"))?;
             let (map, map_bytes) = self.read_sparse_1_0_map()?;
@@ -694,7 +708,19 @@ impl<R: Read> Entries<'_, R> {
             .or(pax_u64_checked(pax, "GNU.sparse.realsize")?)
             .ok_or_else(|| invalid("GNU sparse PAX metadata lacks logical size"))?;
         let map = if let Some(value) = pax_text_checked(pax, "GNU.sparse.map")? {
-            parse_sparse_csv(value)?
+            if pax
+                .iter()
+                .any(|(key, _)| matches!(key.as_str(), "GNU.sparse.offset" | "GNU.sparse.numbytes"))
+            {
+                return Err(invalid("GNU sparse PAX metadata mixes maps and pairs"));
+            }
+            let map = parse_sparse_csv(value)?;
+            if pax_u64_checked(pax, "GNU.sparse.numblocks")?
+                .is_some_and(|count| usize::try_from(count).ok() != Some(map.len()))
+            {
+                return Err(invalid("GNU sparse PAX map count does not match"));
+            }
+            map
         } else if let Some(count) = pax_u64_checked(pax, "GNU.sparse.numblocks")? {
             parse_sparse_pairs(pax, count)?
         } else {
