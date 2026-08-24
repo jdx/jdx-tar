@@ -838,6 +838,12 @@ impl<R: Read> Read for Entry<R> {
         if buf.is_empty() || self.logical_pos >= self.logical_size {
             return Ok(0);
         }
+        if self.generation != self.state.borrow().generation {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "entry is stale because iteration advanced",
+            ));
+        }
         let remaining = self.logical_size - self.logical_pos;
         let limit = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
         let Some(map) = self.sparse.as_ref() else {
