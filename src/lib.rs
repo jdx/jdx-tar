@@ -573,6 +573,20 @@ impl<R: Read> Entries<'_, R> {
                 ));
             }
             let kind = EntryType::from_flag(flag);
+            if header.path.is_empty() {
+                return Err(invalid("tar entry has an empty effective path"));
+            }
+            if header.path.contains(&0) {
+                return Err(invalid("tar entry path contains a NUL byte"));
+            }
+            if matches!(kind, EntryType::Symlink | EntryType::Hardlink)
+                && header
+                    .link_name
+                    .as_ref()
+                    .is_none_or(|target| target.is_empty() || target.contains(&0))
+            {
+                return Err(invalid("tar link entry has an empty or NUL-bearing target"));
+            }
             self.pending_global_pax_bytes = 0;
             return Ok(Some(Entry {
                 state: Rc::clone(&self.state),
