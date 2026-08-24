@@ -533,7 +533,15 @@ impl<R: Read> Entries<'_, R> {
             }
         }
         let mut extended = block[482] != 0;
+        // Include the inline descriptors and each full continuation block.
+        let mut metadata_bytes = 96_u64;
         while extended {
+            metadata_bytes = metadata_bytes
+                .checked_add(BLOCK)
+                .ok_or_else(|| invalid("old GNU sparse metadata size overflow"))?;
+            if metadata_bytes > MAX_METADATA_SIZE {
+                return Err(invalid("old GNU sparse metadata exceeds 1 MiB limit"));
+            }
             let mut ext = [0_u8; 512];
             self.state.borrow_mut().read_exact_counted(&mut ext)?;
             for chunk in ext[..504].chunks_exact(24) {
@@ -622,6 +630,9 @@ impl<R: Read> Entries<'_, R> {
     fn read_sparse_line(&self, consumed: &mut u64) -> Result<u64> {
         let mut digits = Vec::with_capacity(20);
         loop {
+            if *consumed >= MAX_METADATA_SIZE {
+                return Err(invalid("GNU sparse 1.0 metadata exceeds 1 MiB limit"));
+            }
             let mut byte = [0_u8; 1];
             let mut state = self.state.borrow_mut();
             if state.pending == 0 {
