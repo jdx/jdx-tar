@@ -224,13 +224,11 @@ fn long_record_size(value: &[u8]) -> Result<u64> {
 fn encode_header(header: &Header) -> Result<[u8; BLOCK_LEN]> {
     let mut block = [0_u8; BLOCK_LEN];
     write_bytes(&mut block[..NAME_LEN], &header.path);
-    write_octal(&mut block[100..108], u64::from(header.mode), "mode")?;
-    write_octal(&mut block[108..116], header.uid, "uid")?;
-    write_octal(&mut block[116..124], header.gid, "gid")?;
-    write_octal(&mut block[124..136], header.stored_size, "size")?;
-    let mtime =
-        u64::try_from(header.mtime).map_err(|_| invalid("negative mtimes require a PAX header"))?;
-    write_octal(&mut block[136..148], mtime, "mtime")?;
+    write_numeric(&mut block[100..108], u64::from(header.mode), "mode")?;
+    write_numeric(&mut block[108..116], header.uid, "uid")?;
+    write_numeric(&mut block[116..124], header.gid, "gid")?;
+    write_numeric(&mut block[124..136], header.stored_size, "size")?;
+    write_signed_numeric(&mut block[136..148], header.mtime, "mtime")?;
     block[148..156].fill(b' ');
     block[156] = header.type_flag;
     if let Some(target) = &header.link_name {
@@ -247,17 +245,40 @@ fn write_bytes(field: &mut [u8], value: &[u8]) {
     field[..len].copy_from_slice(&value[..len]);
 }
 
-fn write_octal(field: &mut [u8], value: u64, name: &'static str) -> Result<()> {
+fn write_numeric(field: &mut [u8], value: u64, name: &'static str) -> Result<()> {
     let digits = field.len() - 1;
-    let value = format!("{value:0digits$o}");
-    if value.len() > digits {
+    let octal = format!("{value:0digits$o}");
+    if octal.len() <= digits {
+        field[..digits].copy_from_slice(octal.as_bytes());
+        field[digits] = 0;
+        return Ok(());
+    }
+
+    if field.len() < 9 && value >= (1_u64 << ((field.len() - 1) * 8)) {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!("tar {name} does not fit in its header field"),
         ));
     }
-    field[..digits].copy_from_slice(value.as_bytes());
-    field[digits] = 0;
+    field.fill(0);
+    let encoded = value.to_be_bytes();
+    let start = field.len().saturating_sub(encoded.len());
+    let source = encoded.len().saturating_sub(field.len());
+    field[start..].copy_from_slice(&encoded[source..]);
+    field[0] |= 0x80;
+    Ok(())
+}
+
+fn write_signed_numeric(field: &mut [u8], value: i64, name: &'static str) -> Result<()> {
+    if value >= 0 {
+        return write_numeric(field, value.unsigned_abs(), name);
+    }
+    field.fill(0xff);
+    let encoded = value.to_be_bytes();
+    let start = field.len().saturating_sub(encoded.len());
+    let source = encoded.len().saturating_sub(field.len());
+    field[start..].copy_from_slice(&encoded[source..]);
+    field[0] |= 0x80;
     Ok(())
 }
 
