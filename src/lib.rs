@@ -427,11 +427,18 @@ impl<R: Read> Entries<'_, R> {
             // GNU sparse PAX archives use the tar header's size for the packed
             // body. Some writers (notably Go's archive/tar) also emit a PAX
             // `size` record containing the logical sparse size.
-            let physical_size = if pax.iter().any(|(key, _)| key.starts_with("GNU.sparse.")) {
+            let has_pax_sparse = pax.iter().any(|(key, _)| key.starts_with("GNU.sparse."));
+            if has_pax_sparse && !matches!(flag, 0 | b'0' | b'7') {
+                return Err(invalid("GNU sparse PAX metadata requires a regular file"));
+            }
+            let physical_size = if has_pax_sparse {
                 size
             } else {
                 header.stored_size
             };
+            if matches!(flag, b'1'..=b'6') && (size != 0 || physical_size != 0) {
+                return Err(invalid("nonregular tar entry cannot carry payload"));
+            }
             header.stored_size = physical_size;
             let generation;
             {
