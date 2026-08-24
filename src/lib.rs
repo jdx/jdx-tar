@@ -533,6 +533,7 @@ impl<R: Read> Entries<'_, R> {
             // GNU sparse PAX archives use the tar header's size for the packed
             // body. Some writers (notably Go's archive/tar) also emit a PAX
             // `size` record containing the logical sparse size.
+            let pax_size = header.stored_size;
             let has_pax_sparse = pax.iter().any(|(key, _)| key.starts_with("GNU.sparse."));
             if has_pax_sparse && !matches!(flag, 0 | b'0' | b'7') {
                 return Err(invalid("GNU sparse PAX metadata requires a regular file"));
@@ -540,7 +541,7 @@ impl<R: Read> Entries<'_, R> {
             let physical_size = if has_pax_sparse {
                 size
             } else {
-                header.stored_size
+                pax_size
             };
             if matches!(flag, b'1'..=b'6') && (size != 0 || physical_size != 0) {
                 return Err(invalid("nonregular tar entry cannot carry payload"));
@@ -559,6 +560,11 @@ impl<R: Read> Entries<'_, R> {
             } else {
                 self.parse_pax_sparse(&pax, physical_size)?
             };
+            if has_pax_sparse && pax_size != physical_size && pax_size != logical_size {
+                return Err(invalid(
+                    "GNU sparse PAX size conflicts with physical and logical sizes",
+                ));
+            }
             if let Some(name) = pax_value(&pax, "GNU.sparse.name") {
                 header.path = name.to_vec();
             }
