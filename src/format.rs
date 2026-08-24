@@ -306,7 +306,7 @@ pub(super) fn validate_sparse(
 }
 
 pub(super) fn trim_metadata(mut data: Vec<u8>) -> Vec<u8> {
-    while data.last().is_some_and(|byte| *byte == 0 || *byte == b'\n') {
+    while data.last() == Some(&0) {
         data.pop();
     }
     data
