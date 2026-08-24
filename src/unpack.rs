@@ -248,7 +248,7 @@ pub(super) fn unpack_archive<R: Read>(
                 deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
                 summary.dirs += 1;
             }
-            EntryType::File => {
+            EntryType::File | EntryType::Other(_) => {
                 if !prepare_output(&output, opts.overwrite)? {
                     summary.skipped.push(SkippedEntry {
                         path: original,
@@ -397,7 +397,7 @@ pub(super) fn unpack_entry<R: Read>(
             deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
             summary.dirs = 1;
         }
-        EntryType::File => {
+        EntryType::File | EntryType::Other(_) => {
             if !prepare_output(&output, opts.overwrite)? {
                 summary.skipped.push(SkippedEntry {
                     path: original,
