@@ -9,7 +9,7 @@ mod unpack;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -31,6 +31,24 @@ use unpack::{ProgressReporter, unpack_archive};
 const BLOCK: u64 = 512;
 const MAX_METADATA_SIZE: u64 = 1024 * 1024;
 const MAX_SPARSE_SEGMENTS: usize = 1_000_000;
+const PAX_HEADER_KEYS: [&str; 7] = ["path", "linkpath", "size", "mode", "uid", "gid", "mtime"];
+type PaxRecords = Vec<(String, Vec<u8>)>;
+
+struct PaxLayer {
+    parent: Option<Rc<Self>>,
+    records: BTreeMap<String, Vec<u8>>,
+}
+
+impl Drop for PaxLayer {
+    fn drop(&mut self) {
+        // Retained entries can keep a long update chain alive. Release uniquely
+        // owned ancestors iteratively rather than recursively dropping it.
+        let mut parent = self.parent.take();
+        while let Some(mut layer) = parent {
+            parent = Rc::get_mut(&mut layer).and_then(|layer| layer.parent.take());
+        }
+    }
+}
 
 /// The crate's result type.
 pub type Result<T> = io::Result<T>;
@@ -284,6 +302,7 @@ impl<R: Read> Archive<R> {
             zero_blocks: 0,
             global_pax: BTreeMap::new(),
             pending_global_pax_bytes: 0,
+            global_pax_snapshot: None,
             local_pax: None,
             long_name: None,
             long_link: None,
@@ -313,6 +332,7 @@ pub struct Entries<'a, R: Read> {
     zero_blocks: u8,
     global_pax: BTreeMap<String, Vec<u8>>,
     pending_global_pax_bytes: u64,
+    global_pax_snapshot: Option<Rc<PaxLayer>>,
     local_pax: Option<Vec<(String, Vec<u8>)>>,
     long_name: Option<Vec<u8>>,
     long_link: Option<Vec<u8>>,
@@ -421,12 +441,21 @@ impl<R: Read> Entries<'_, R> {
                         {
                             return Err(invalid("GNU sparse PAX metadata is not valid globally"));
                         }
-                        for (key, value) in records {
+                        for (key, value) in &records {
                             if value.is_empty() {
-                                self.global_pax.remove(&key);
+                                self.global_pax.remove(key);
                             } else {
-                                self.global_pax.insert(key, value);
+                                self.global_pax.insert(key.clone(), value.clone());
                             }
+                        }
+                        if let Some(layer) = self.global_pax_snapshot.as_mut().and_then(Rc::get_mut)
+                        {
+                            layer.records.extend(records);
+                        } else {
+                            self.global_pax_snapshot = Some(Rc::new(PaxLayer {
+                                parent: self.global_pax_snapshot.take(),
+                                records: records.into_iter().collect(),
+                            }));
                         }
                     }
                     b'L' => self.long_name = Some(trim_metadata(payload)),
@@ -436,15 +465,42 @@ impl<R: Read> Entries<'_, R> {
                 continue;
             }
 
-            let mut pax: Vec<(String, Vec<u8>)> = self
-                .global_pax
+            let pax_global = self.global_pax_snapshot.clone();
+            let mut pax_local = self.local_pax.take().unwrap_or_default();
+            let pax_local_keys = pax_local
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if let Some(local) = self.local_pax.take() {
-                pax.retain(|(existing, _)| !local.iter().any(|(key, _)| key == existing));
-                pax.extend(local.into_iter().filter(|(_, value)| !value.is_empty()));
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
+            pax_local.retain(|(_, value)| !value.is_empty());
+
+            // Resolve only fields used by header/sparse interpretation. Other
+            // global records remain shared until a caller requests them.
+            let mut pax = Vec::new();
+            for key in PAX_HEADER_KEYS {
+                if let Some(value) = self
+                    .global_pax
+                    .get(key)
+                    .filter(|_| !pax_local_keys.contains(key))
+                {
+                    pax.push((key.to_owned(), value.clone()));
+                }
             }
+            for (key, value) in self.global_pax.range("GNU.sparse.".to_owned()..) {
+                if !key.starts_with("GNU.sparse.") {
+                    break;
+                }
+                if !pax_local_keys.contains(key) {
+                    pax.push((key.clone(), value.clone()));
+                }
+            }
+            pax.extend(
+                pax_local
+                    .iter()
+                    .filter(|(key, _)| {
+                        PAX_HEADER_KEYS.contains(&key.as_str()) || key.starts_with("GNU.sparse.")
+                    })
+                    .cloned(),
+            );
             if let Some(name) = self.long_name.take() {
                 header.path = name;
             }
@@ -491,7 +547,9 @@ impl<R: Read> Entries<'_, R> {
                 state: Rc::clone(&self.state),
                 header,
                 kind,
-                pax,
+                pax_global,
+                pax_local,
+                pax_local_keys,
                 sparse,
                 logical_size,
                 logical_pos: 0,
@@ -662,7 +720,9 @@ pub struct Entry<R: Read> {
     state: Rc<RefCell<ReaderState<R>>>,
     header: Header,
     kind: EntryType,
-    pax: Vec<(String, Vec<u8>)>,
+    pax_global: Option<Rc<PaxLayer>>,
+    pax_local: PaxRecords,
+    pax_local_keys: BTreeSet<String>,
     sparse: Option<Vec<SparseSegment>>,
     logical_size: u64,
     logical_pos: u64,
@@ -701,9 +761,28 @@ impl<R: Read> Entry<R> {
     }
     /// Iterates over effective PAX key/value records.
     pub fn pax_extensions(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.pax
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_slice()))
+        let mut layers = Vec::new();
+        let mut layer = self.pax_global.as_deref();
+        while let Some(current) = layer {
+            layers.push(current);
+            layer = current.parent.as_deref();
+        }
+        let mut global = BTreeMap::new();
+        for layer in layers.into_iter().rev() {
+            for (key, value) in &layer.records {
+                if value.is_empty() {
+                    global.remove(key.as_str());
+                } else {
+                    global.insert(key.as_str(), value.as_slice());
+                }
+            }
+        }
+        global.retain(|key, _| !self.pax_local_keys.contains(*key));
+        global.into_iter().chain(
+            self.pax_local
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_slice())),
+        )
     }
     /// Returns cumulative raw bytes consumed from the underlying stream.
     #[must_use]
