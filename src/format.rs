@@ -133,7 +133,7 @@ pub(super) fn parse_pax(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         if length == 0
             || cursor
                 .checked_add(length)
-                .is_none_or(|end| end > data.len())
+                .is_none_or(|end| end > data.len() || end < space + 1)
         {
             return Err(invalid("PAX record exceeds extension body"));
         }
