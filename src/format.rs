@@ -72,22 +72,26 @@ pub(super) fn parse_number(field: &[u8]) -> Result<u64> {
         }
         return Ok(value);
     }
-    let trimmed = field
+    let start = field
         .iter()
-        .copied()
-        .skip_while(|byte| matches!(byte, 0 | b' '))
-        .take_while(u8::is_ascii_digit)
-        .collect::<Vec<_>>();
-    if trimmed.is_empty() {
-        return Ok(0);
-    }
-    if trimmed.iter().any(|byte| !(b'0'..=b'7').contains(byte)) {
+        .position(|byte| *byte != b' ')
+        .unwrap_or(field.len());
+    let digits = field[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(field.len() - start);
+    let end = start + digits;
+    if field[end..].iter().any(|byte| !matches!(byte, 0 | b' '))
+        || field[start..end]
+            .iter()
+            .any(|byte| !(b'0'..=b'7').contains(byte))
+    {
         return Err(invalid("invalid octal numeric field"));
     }
-    trimmed.into_iter().try_fold(0_u64, |value, byte| {
+    field[start..end].iter().try_fold(0_u64, |value, byte| {
         value
             .checked_mul(8)
-            .and_then(|v| v.checked_add(u64::from(byte - b'0')))
+            .and_then(|v| v.checked_add(u64::from(*byte - b'0')))
             .ok_or_else(|| invalid("numeric field overflow"))
     })
 }
