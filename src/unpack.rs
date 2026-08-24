@@ -264,6 +264,13 @@ pub(super) fn unpack_archive<R: Read>(
         } else {
             None
         };
+        validate_mtime_before_output(
+            entry.kind,
+            entry.header.mtime,
+            opts.preserve_mtime,
+            &output,
+            opts.overwrite,
+        )?;
         ensure_safe_parents(&root, &relative)?;
         match entry.kind {
             EntryType::Directory => {
@@ -450,6 +457,13 @@ pub(super) fn unpack_entry<R: Read>(
     } else {
         None
     };
+    validate_mtime_before_output(
+        entry.kind,
+        entry.header.mtime,
+        opts.preserve_mtime,
+        &output,
+        opts.overwrite,
+    )?;
     ensure_safe_parents(root, &relative)?;
     match entry.kind {
         EntryType::Directory => {
@@ -841,6 +855,25 @@ fn is_reserved_path(path: &Path) -> bool {
 #[cfg(not(windows))]
 fn is_reserved_path(_path: &Path) -> bool {
     false
+}
+
+fn validate_mtime_before_output(
+    kind: EntryType,
+    mtime: i64,
+    preserve_mtime: bool,
+    output: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    let skips_existing_file =
+        kind == EntryType::File && !overwrite && fs::symlink_metadata(output).is_ok();
+    if preserve_mtime
+        && matches!(kind, EntryType::File | EntryType::Directory)
+        && mtime == i64::MIN
+        && !skips_existing_file
+    {
+        return Err(invalid("tar mtime is too small to restore safely"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -108,14 +108,15 @@ pub(super) fn parse_number(field: &[u8]) -> Result<u64> {
 
 pub(super) fn parse_signed_number(field: &[u8]) -> Result<i64> {
     if field.first().is_some_and(|byte| byte & 0x80 != 0) && field[0] & 0x40 != 0 {
+        let start = field.len().saturating_sub(8);
+        if field[..start].iter().any(|byte| *byte != 0xff)
+            || (start != 0 && field[start] & 0x80 == 0)
+        {
+            return Err(invalid("signed numeric field overflow"));
+        }
         let mut bytes = [0xff_u8; 8];
-        let source = if field.len() > 8 {
-            &field[field.len() - 8..]
-        } else {
-            field
-        };
+        let source = &field[start..];
         bytes[8 - source.len()..].copy_from_slice(source);
-        bytes[8 - source.len()] &= 0x7f;
         return Ok(i64::from_be_bytes(bytes));
     }
     i64::try_from(parse_number(field)?).map_err(|_| invalid("signed numeric field overflow"))
@@ -188,8 +189,7 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
         header.gid = gid;
     }
     if let Some(mtime) = pax_text_checked(pax, "mtime")? {
-        let integral = mtime.split('.').next().unwrap_or(mtime);
-        header.mtime = integral.parse().map_err(|_| invalid("invalid PAX mtime"))?;
+        header.mtime = parse_pax_mtime(mtime)?;
     }
     Ok(())
 }
@@ -336,6 +336,29 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> Cow<'_, Path> {
 #[cfg(not(unix))]
 pub(super) fn bytes_to_path(bytes: &[u8]) -> Cow<'_, Path> {
     Cow::Owned(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+fn parse_pax_mtime(value: &str) -> Result<i64> {
+    let (integral, fraction) = match value.split_once('.') {
+        Some((integral, fraction))
+            if !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (integral, Some(fraction))
+        }
+        Some(_) => return Err(invalid("invalid PAX mtime")),
+        None => (value, None),
+    };
+    let negative = integral.starts_with('-');
+    let seconds = integral
+        .parse::<i64>()
+        .map_err(|_| invalid("invalid PAX mtime"))?;
+    if negative && fraction.is_some_and(|fraction| fraction.bytes().any(|byte| byte != b'0')) {
+        seconds
+            .checked_sub(1)
+            .ok_or_else(|| invalid("PAX mtime is out of range"))
+    } else {
+        Ok(seconds)
+    }
 }
 
 #[cfg(test)]
