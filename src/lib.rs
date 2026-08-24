@@ -460,8 +460,18 @@ impl<R: Read> Entries<'_, R> {
                             }));
                         }
                     }
-                    b'L' => self.long_name = Some(trim_metadata(payload)),
-                    b'K' => self.long_link = Some(trim_metadata(payload)),
+                    b'L' => {
+                        if self.long_name.is_some() {
+                            return Err(invalid("two GNU long-name headers describe one entry"));
+                        }
+                        self.long_name = Some(trim_metadata(payload));
+                    }
+                    b'K' => {
+                        if self.long_link.is_some() {
+                            return Err(invalid("two GNU long-link headers describe one entry"));
+                        }
+                        self.long_link = Some(trim_metadata(payload));
+                    }
                     _ => unreachable!(),
                 }
                 continue;
@@ -502,6 +512,16 @@ impl<R: Read> Entries<'_, R> {
                     })
                     .cloned(),
             );
+            if self.long_name.is_some() && pax_value(&pax, "path").is_some() {
+                return Err(invalid(
+                    "PAX path and GNU long-name describe the same entry",
+                ));
+            }
+            if self.long_link.is_some() && pax_value(&pax, "linkpath").is_some() {
+                return Err(invalid(
+                    "PAX linkpath and GNU long-link describe the same entry",
+                ));
+            }
             if let Some(name) = self.long_name.take() {
                 header.path = name;
             }
