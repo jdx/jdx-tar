@@ -442,11 +442,7 @@ impl<R: Read> Entries<'_, R> {
                             return Err(invalid("GNU sparse PAX metadata is not valid globally"));
                         }
                         for (key, value) in &records {
-                            if value.is_empty() {
-                                self.global_pax.remove(key);
-                            } else {
-                                self.global_pax.insert(key.clone(), value.clone());
-                            }
+                            self.global_pax.insert(key.clone(), value.clone());
                         }
                         if let Some(layer) = self.global_pax_snapshot.as_mut().and_then(Rc::get_mut)
                         {
@@ -471,7 +467,6 @@ impl<R: Read> Entries<'_, R> {
                 .iter()
                 .map(|(key, _)| key.clone())
                 .collect::<BTreeSet<_>>();
-            pax_local.retain(|(_, value)| !value.is_empty());
 
             // Resolve only fields used by header/sparse interpretation. Other
             // global records remain shared until a caller requests them.
@@ -540,6 +535,16 @@ impl<R: Read> Entries<'_, R> {
             };
             if let Some(name) = pax_value(&pax, "GNU.sparse.name") {
                 header.path = name.to_vec();
+            }
+            if header.path.is_empty() && pax_value(&pax, "path").is_some_and(<[u8]>::is_empty) {
+                return Err(invalid("PAX path deletion leaves entry without a path"));
+            }
+            if matches!(flag, b'1' | b'2')
+                && pax_value(&pax, "linkpath").is_some_and(<[u8]>::is_empty)
+            {
+                return Err(invalid(
+                    "PAX linkpath deletion leaves link without a target",
+                ));
             }
             let kind = EntryType::from_flag(flag);
             self.pending_global_pax_bytes = 0;

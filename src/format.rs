@@ -176,7 +176,7 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
         header.path = path.to_vec();
     }
     if let Some(link) = pax_value(pax, "linkpath") {
-        header.link_name = Some(link.to_vec());
+        header.link_name = (!link.is_empty()).then(|| link.to_vec());
     }
     if let Some(size) = pax_u64_checked(pax, "size")? {
         header.stored_size = size;
