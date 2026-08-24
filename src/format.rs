@@ -245,7 +245,7 @@ pub(super) fn parse_sparse_pairs(
     let mut pairs = pax
         .iter()
         .filter(|(key, _)| matches!(key.as_str(), "GNU.sparse.offset" | "GNU.sparse.numbytes"));
-    let mut map = Vec::with_capacity(count);
+    let mut map = Vec::new();
     for _ in 0..count {
         let offset = pairs
             .next()

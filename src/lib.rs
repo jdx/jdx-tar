@@ -608,7 +608,7 @@ impl<R: Read> Entries<'_, R> {
         if count > MAX_SPARSE_SEGMENTS {
             return Err(invalid("sparse map has too many segments"));
         }
-        let mut map = Vec::with_capacity(count);
+        let mut map = Vec::new();
         for _ in 0..count {
             let offset = self.read_sparse_line(&mut consumed)?;
             let len = self.read_sparse_line(&mut consumed)?;
