@@ -245,7 +245,7 @@ pub(super) fn unpack_archive<R: Read>(
             continue;
         }
         let output = root.join(&relative);
-        if entry.kind == EntryType::Hardlink
+        if matches!(entry.kind, EntryType::Hardlink | EntryType::Symlink)
             && skip_existing_output(&root, &relative, opts.overwrite)?
         {
             summary.skipped.push(SkippedEntry {
@@ -314,19 +314,21 @@ pub(super) fn unpack_archive<R: Read>(
                 summary.files += 1;
             }
             EntryType::Symlink => {
-                if !prepare_output(&output, opts.overwrite)? {
-                    summary.skipped.push(SkippedEntry {
-                        path: original,
-                        reason: SkipReason::Exists,
-                    });
-                    continue;
-                }
                 let target = entry
                     .header
                     .link_name()
                     .ok_or_else(|| invalid("symlink lacks target"))?;
-                match create_symlink(&target, &output) {
-                    Ok(()) => summary.symlinks += 1,
+                match replace_output_with_link(&output, opts.overwrite, |path| {
+                    create_symlink(&target, path)
+                }) {
+                    Ok(true) => summary.symlinks += 1,
+                    Ok(false) => {
+                        summary.skipped.push(SkippedEntry {
+                            path: original,
+                            reason: SkipReason::Exists,
+                        });
+                        continue;
+                    }
                     Err(err)
                         if cfg!(windows)
                             && matches!(
@@ -343,17 +345,18 @@ pub(super) fn unpack_archive<R: Read>(
                 }
             }
             EntryType::Hardlink => {
-                if !prepare_output(&output, opts.overwrite)? {
+                let source = hardlink_source
+                    .as_ref()
+                    .ok_or_else(|| invalid("hardlink source was not prepared"))?;
+                if !replace_output_with_link(&output, opts.overwrite, |path| {
+                    fs::hard_link(source, path)
+                })? {
                     summary.skipped.push(SkippedEntry {
                         path: original,
                         reason: SkipReason::Exists,
                     });
                     continue;
                 }
-                let source = hardlink_source
-                    .as_ref()
-                    .ok_or_else(|| invalid("hardlink source was not prepared"))?;
-                fs::hard_link(source, output)?;
                 summary.hardlinks += 1;
             }
             _ => summary.skipped.push(SkippedEntry {
@@ -428,7 +431,9 @@ pub(super) fn unpack_entry<R: Read>(
         return Ok(summary);
     }
     let output = root.join(&relative);
-    if entry.kind == EntryType::Hardlink && skip_existing_output(root, &relative, opts.overwrite)? {
+    if matches!(entry.kind, EntryType::Hardlink | EntryType::Symlink)
+        && skip_existing_output(root, &relative, opts.overwrite)?
+    {
         summary.skipped.push(SkippedEntry {
             path: original,
             reason: SkipReason::Exists,
@@ -499,20 +504,24 @@ pub(super) fn unpack_entry<R: Read>(
             summary.files = 1;
         }
         EntryType::Symlink => {
-            if !prepare_output(&output, opts.overwrite)? {
-                summary.skipped.push(SkippedEntry {
-                    path: original,
-                    reason: SkipReason::Exists,
-                });
-                return Ok(summary);
-            }
-            entry.extraction_started = true;
             let target = entry
                 .header
                 .link_name()
                 .ok_or_else(|| invalid("symlink lacks target"))?;
-            match create_symlink(&target, &output) {
-                Ok(()) => summary.symlinks = 1,
+            match replace_output_with_link(&output, opts.overwrite, |path| {
+                create_symlink(&target, path)
+            }) {
+                Ok(true) => {
+                    entry.extraction_started = true;
+                    summary.symlinks = 1;
+                }
+                Ok(false) => {
+                    summary.skipped.push(SkippedEntry {
+                        path: original,
+                        reason: SkipReason::Exists,
+                    });
+                    return Ok(summary);
+                }
                 Err(err)
                     if cfg!(windows)
                         && matches!(
@@ -529,7 +538,12 @@ pub(super) fn unpack_entry<R: Read>(
             }
         }
         EntryType::Hardlink => {
-            if !prepare_output(&output, opts.overwrite)? {
+            let source = hardlink_source
+                .as_ref()
+                .ok_or_else(|| invalid("hardlink source was not prepared"))?;
+            if !replace_output_with_link(&output, opts.overwrite, |path| {
+                fs::hard_link(source, path)
+            })? {
                 summary.skipped.push(SkippedEntry {
                     path: original,
                     reason: SkipReason::Exists,
@@ -537,10 +551,6 @@ pub(super) fn unpack_entry<R: Read>(
                 return Ok(summary);
             }
             entry.extraction_started = true;
-            let source = hardlink_source
-                .as_ref()
-                .ok_or_else(|| invalid("hardlink source was not prepared"))?;
-            fs::hard_link(source, output)?;
             summary.hardlinks = 1;
         }
         _ => summary.skipped.push(SkippedEntry {
@@ -655,6 +665,59 @@ fn preflight_hardlink_source<R: Read>(
         Err(err) => return Err(err),
     }
     Ok(source)
+}
+
+struct TemporaryLink(PathBuf);
+
+impl Drop for TemporaryLink {
+    fn drop(&mut self) {
+        // A successful rename normally removes this name. It can also be a
+        // no-op when both names already refer to the same hard-linked inode.
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn replace_output_with_link(
+    path: &Path,
+    overwrite: bool,
+    create: impl Fn(&Path) -> Result<()>,
+) -> Result<bool> {
+    static NEXT_LINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    match fs::symlink_metadata(path) {
+        Ok(_) if !overwrite => return Ok(false),
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(invalid("archive file collides with existing directory"));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            create(path)?;
+            return Ok(true);
+        }
+        Err(err) => return Err(err),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("link output has no parent directory"))?;
+    for _ in 0..128 {
+        let id = NEXT_LINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = parent.join(format!(".jdx-tar-{}-{id}.link", std::process::id()));
+        match create(&temporary) {
+            Ok(()) => {
+                let temporary = TemporaryLink(temporary);
+                // The destination is untouched until the OS has accepted the
+                // replacement link; a sibling rename commits the change.
+                fs::rename(&temporary.0, path)?;
+                return Ok(true);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "unable to reserve a temporary link name",
+    ))
 }
 
 fn skip_existing_output(root: &Path, relative: &Path, overwrite: bool) -> Result<bool> {

@@ -468,7 +468,7 @@ impl<R: Read> Entries<'_, R> {
             }
 
             let pax_global = self.global_pax_snapshot.clone();
-            let mut pax_local = self.local_pax.take().unwrap_or_default();
+            let pax_local = self.local_pax.take().unwrap_or_default();
             let pax_local_keys = pax_local
                 .iter()
                 .map(|(key, _)| key.clone())
