@@ -294,8 +294,14 @@ impl<R: Read> Archive<R> {
     ///
     /// # Errors
     ///
-    /// Reserved for reader initialization errors in future versions.
+    /// Returns an error if a previous iterator has consumed archive bytes.
     pub fn entries(&mut self) -> Result<Entries<'_, R>> {
+        if self.state.borrow().raw_bytes != 0 {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "cannot restart entry iteration after consuming archive bytes",
+            ));
+        }
         Ok(Entries {
             state: Rc::clone(&self.state),
             done: false,

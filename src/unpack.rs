@@ -198,6 +198,7 @@ pub(super) fn unpack_archive<R: Read>(
     dest: &Path,
     opts: &mut UnpackOptions,
 ) -> Result<UnpackSummary> {
+    let mut entries = archive.entries()?;
     fs::create_dir_all(dest)?;
     if fs::symlink_metadata(dest)?.file_type().is_symlink() {
         return Err(invalid("destination may not be a symlink"));
@@ -211,7 +212,6 @@ pub(super) fn unpack_archive<R: Read>(
         callback: &mut opts.on_progress,
         last: 0,
     };
-    let mut entries = archive.entries()?;
     for item in &mut entries {
         let mut entry = item?;
         validate_directory_suffixes(&entry)?;
