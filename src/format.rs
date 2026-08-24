@@ -264,8 +264,13 @@ pub(super) fn push_sparse_pair(
     offset: &[u8],
     len: &[u8],
 ) -> Result<bool> {
-    if offset.first() == Some(&0) {
+    let offset_empty = offset.first() == Some(&0);
+    let len_empty = len.first() == Some(&0);
+    if offset_empty && len_empty {
         return Ok(false);
+    }
+    if offset_empty || len_empty {
+        return Err(invalid("partial old GNU sparse map entry"));
     }
     let offset = parse_number(offset)?;
     let len = parse_number(len)?;
