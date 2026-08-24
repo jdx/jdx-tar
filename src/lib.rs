@@ -283,6 +283,7 @@ impl<R: Read> Archive<R> {
             done: false,
             zero_blocks: 0,
             global_pax: BTreeMap::new(),
+            pending_global_pax_bytes: 0,
             local_pax: None,
             long_name: None,
             long_link: None,
@@ -311,6 +312,7 @@ pub struct Entries<'a, R: Read> {
     done: bool,
     zero_blocks: u8,
     global_pax: BTreeMap<String, Vec<u8>>,
+    pending_global_pax_bytes: u64,
     local_pax: Option<Vec<(String, Vec<u8>)>>,
     long_name: Option<Vec<u8>>,
     long_link: Option<Vec<u8>>,
@@ -391,6 +393,16 @@ impl<R: Read> Entries<'_, R> {
                         ErrorKind::InvalidData,
                         "tar metadata exceeds 1 MiB limit",
                     ));
+                }
+                if flag == b'g' {
+                    let total = self
+                        .pending_global_pax_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| invalid("global PAX metadata size overflow"))?;
+                    if total > MAX_METADATA_SIZE {
+                        return Err(invalid("pending global PAX metadata exceeds 1 MiB limit"));
+                    }
+                    self.pending_global_pax_bytes = total;
                 }
                 let payload = self.read_metadata(size)?;
                 match flag {
@@ -474,6 +486,7 @@ impl<R: Read> Entries<'_, R> {
                 header.path = name.to_vec();
             }
             let kind = EntryType::from_flag(flag);
+            self.pending_global_pax_bytes = 0;
             return Ok(Some(Entry {
                 state: Rc::clone(&self.state),
                 header,
