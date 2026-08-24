@@ -704,8 +704,18 @@ impl<R: Read> Entries<'_, R> {
                 "unsupported or contradictory GNU sparse PAX version",
             ));
         }
-        let logical = pax_u64_checked(pax, "GNU.sparse.size")?
-            .or(pax_u64_checked(pax, "GNU.sparse.realsize")?)
+        let size = pax_u64_checked(pax, "GNU.sparse.size")?;
+        let realsize = pax_u64_checked(pax, "GNU.sparse.realsize")?;
+        if size
+            .zip(realsize)
+            .is_some_and(|(size, realsize)| size != realsize)
+        {
+            return Err(invalid(
+                "GNU sparse PAX metadata has conflicting logical sizes",
+            ));
+        }
+        let logical = size
+            .or(realsize)
             .ok_or_else(|| invalid("GNU sparse PAX metadata lacks logical size"))?;
         let map = if let Some(value) = pax_text_checked(pax, "GNU.sparse.map")? {
             if pax
