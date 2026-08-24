@@ -2,6 +2,8 @@ use super::format::path_requires_directory;
 use super::{Archive, Entry, EntryType, Result, error, invalid};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Progress notification containing raw input bytes consumed.
@@ -110,7 +112,31 @@ impl Default for UnpackOptions {
 pub struct EntryUnpacker<'a> {
     root: PathBuf,
     opts: &'a mut UnpackOptions,
-    deferred_dirs: Vec<(PathBuf, u32, i64)>,
+    deferred_dirs: Vec<DeferredDirectory>,
+}
+
+pub(super) struct DeferredDirectory {
+    path: PathBuf,
+    mode: u32,
+    mtime: i64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl DeferredDirectory {
+    fn new(path: PathBuf, mode: u32, mtime: i64) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(invalid("archive directory is not a directory"));
+        }
+        Ok(Self {
+            path,
+            mode,
+            mtime,
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
 }
 
 impl<'a> EntryUnpacker<'a> {
@@ -287,11 +313,11 @@ pub(super) fn unpack_archive<R: Read>(
                     return Err(invalid("archive directory collides with symlink"));
                 }
                 fs::create_dir_all(&output)?;
-                deferred_dirs.push((
-                    fs::canonicalize(output)?,
+                deferred_dirs.push(DeferredDirectory::new(
+                    output,
                     entry.header.mode,
                     entry.header.mtime,
-                ));
+                )?);
                 summary.dirs += 1;
             }
             EntryType::File | EntryType::Other(_) => {
@@ -320,8 +346,8 @@ pub(super) fn unpack_archive<R: Read>(
                         progress.update(entry.bytes_read());
                     }
                 }
-                apply_metadata(
-                    &output,
+                apply_file_metadata(
+                    &file,
                     entry.header.mode,
                     entry.header.mtime,
                     preserve_permissions,
@@ -392,7 +418,7 @@ pub(super) fn unpack_entry<R: Read>(
     entry: &mut Entry<R>,
     root: &Path,
     opts: &mut UnpackOptions,
-    deferred_dirs: &mut Vec<(PathBuf, u32, i64)>,
+    deferred_dirs: &mut Vec<DeferredDirectory>,
 ) -> Result<UnpackSummary> {
     if entry.generation != entry.state.borrow().generation {
         return Err(error(
@@ -490,11 +516,11 @@ pub(super) fn unpack_entry<R: Read>(
             }
             entry.extraction_started = true;
             fs::create_dir_all(&output)?;
-            deferred_dirs.push((
-                fs::canonicalize(output)?,
+            deferred_dirs.push(DeferredDirectory::new(
+                output,
                 entry.header.mode,
                 entry.header.mtime,
-            ));
+            )?);
             summary.dirs = 1;
         }
         EntryType::File | EntryType::Other(_) => {
@@ -526,8 +552,8 @@ pub(super) fn unpack_entry<R: Read>(
                     progress.update(entry.bytes_read());
                 }
             }
-            apply_metadata(
-                &output,
+            apply_file_metadata(
+                &file,
                 entry.header.mode,
                 entry.header.mtime,
                 opts.preserve_permissions,
@@ -782,26 +808,26 @@ fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
 }
 
 fn apply_deferred_directory_metadata(
-    directories: Vec<(PathBuf, u32, i64)>,
+    directories: Vec<DeferredDirectory>,
     preserve_permissions: bool,
     preserve_mtime: bool,
 ) -> Result<()> {
     // Canonical paths coalesce case and Unicode aliases on filesystems that
     // resolve those spellings to the same directory. The last member wins.
     let mut latest = std::collections::BTreeMap::new();
-    for (path, mode, mtime) in directories {
-        latest.insert(path, (mode, mtime));
+    for directory in directories {
+        latest.insert(directory.path.clone(), directory);
     }
     let mut directories: Vec<_> = latest.into_iter().collect();
     directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (path, (mode, mtime)) in directories {
-        apply_metadata(&path, mode, mtime, preserve_permissions, preserve_mtime)?;
+    for (_, directory) in directories {
+        apply_directory_metadata(&directory, preserve_permissions, preserve_mtime)?;
     }
     Ok(())
 }
 
-fn apply_metadata(
-    path: &Path,
+fn apply_file_metadata(
+    file: &fs::File,
     mode: u32,
     mtime: i64,
     preserve_permissions: bool,
@@ -812,11 +838,58 @@ fn apply_metadata(
     #[cfg(unix)]
     if preserve_permissions {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))?;
+        file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
     }
     if preserve_mtime {
         let time = filetime::FileTime::from_unix_time(mtime, 0);
-        filetime::set_file_mtime(path, time)?;
+        filetime::set_file_handle_times(file, None, Some(time))?;
+    }
+    Ok(())
+}
+
+fn apply_directory_metadata(
+    directory: &DeferredDirectory,
+    preserve_permissions: bool,
+    preserve_mtime: bool,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = directory.mode;
+    if !preserve_permissions && !preserve_mtime {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let metadata = {
+        let metadata = fs::symlink_metadata(&directory.path)?;
+        if !metadata.is_dir() || (metadata.dev(), metadata.ino()) != directory.identity {
+            return Err(invalid(
+                "archive directory changed before metadata restoration",
+            ));
+        }
+        metadata
+    };
+    #[cfg(unix)]
+    if preserve_permissions {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            &directory.path,
+            fs::Permissions::from_mode(directory.mode & 0o7777),
+        )?;
+    }
+    if preserve_mtime {
+        let time = filetime::FileTime::from_unix_time(directory.mtime, 0);
+        #[cfg(unix)]
+        {
+            // Restore time without reopening a directory whose archived mode
+            // can remove all access. The captured identity is checked after
+            // callbacks; concurrent tree mutation remains outside the contract.
+            filetime::set_symlink_file_times(
+                &directory.path,
+                filetime::FileTime::from_last_access_time(&metadata),
+                time,
+            )?;
+        }
+        #[cfg(not(unix))]
+        filetime::set_file_mtime(&directory.path, time)?;
     }
     Ok(())
 }

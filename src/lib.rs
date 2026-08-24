@@ -538,11 +538,7 @@ impl<R: Read> Entries<'_, R> {
             if has_pax_sparse && !matches!(flag, 0 | b'0' | b'7') {
                 return Err(invalid("GNU sparse PAX metadata requires a regular file"));
             }
-            let physical_size = if has_pax_sparse {
-                size
-            } else {
-                pax_size
-            };
+            let physical_size = if has_pax_sparse { size } else { pax_size };
             if matches!(flag, b'1'..=b'6') && (size != 0 || physical_size != 0) {
                 return Err(invalid("nonregular tar entry cannot carry payload"));
             }
