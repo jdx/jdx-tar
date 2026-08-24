@@ -245,6 +245,25 @@ pub(super) fn unpack_archive<R: Read>(
             continue;
         }
         let output = root.join(&relative);
+        if entry.kind == EntryType::Hardlink
+            && skip_existing_output(&root, &relative, opts.overwrite)?
+        {
+            summary.skipped.push(SkippedEntry {
+                path: original,
+                reason: SkipReason::Exists,
+            });
+            continue;
+        }
+        let hardlink_source = if entry.kind == EntryType::Hardlink {
+            Some(preflight_hardlink_source(
+                &entry,
+                &root,
+                &output,
+                opts.strip_components,
+            )?)
+        } else {
+            None
+        };
         ensure_safe_parents(&root, &relative)?;
         match entry.kind {
             EntryType::Directory => {
@@ -331,19 +350,9 @@ pub(super) fn unpack_archive<R: Read>(
                     });
                     continue;
                 }
-                let target = entry
-                    .header
-                    .link_name()
-                    .ok_or_else(|| invalid("hardlink lacks target"))?;
-                let target_relative = secure_relative_path(&target, opts.strip_components)?
-                    .ok_or_else(|| invalid("hardlink target was stripped away"))?;
-                ensure_safe_parents(&root, &target_relative)?;
-                let source = root.join(target_relative);
-                let metadata = fs::symlink_metadata(&source)
-                    .map_err(|_| invalid("hardlink target does not exist within destination"))?;
-                if metadata.file_type().is_symlink() {
-                    return Err(invalid("hardlink target may not be a symlink"));
-                }
+                let source = hardlink_source
+                    .as_ref()
+                    .ok_or_else(|| invalid("hardlink source was not prepared"))?;
                 fs::hard_link(source, output)?;
                 summary.hardlinks += 1;
             }
@@ -419,6 +428,23 @@ pub(super) fn unpack_entry<R: Read>(
         return Ok(summary);
     }
     let output = root.join(&relative);
+    if entry.kind == EntryType::Hardlink && skip_existing_output(root, &relative, opts.overwrite)? {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::Exists,
+        });
+        return Ok(summary);
+    }
+    let hardlink_source = if entry.kind == EntryType::Hardlink {
+        Some(preflight_hardlink_source(
+            entry,
+            root,
+            &output,
+            opts.strip_components,
+        )?)
+    } else {
+        None
+    };
     ensure_safe_parents(root, &relative)?;
     match entry.kind {
         EntryType::Directory => {
@@ -511,19 +537,9 @@ pub(super) fn unpack_entry<R: Read>(
                 return Ok(summary);
             }
             entry.extraction_started = true;
-            let target = entry
-                .header
-                .link_name()
-                .ok_or_else(|| invalid("hardlink lacks target"))?;
-            let target_relative = secure_relative_path(&target, opts.strip_components)?
-                .ok_or_else(|| invalid("hardlink target was stripped away"))?;
-            ensure_safe_parents(root, &target_relative)?;
-            let source = root.join(target_relative);
-            let metadata = fs::symlink_metadata(&source)
-                .map_err(|_| invalid("hardlink target does not exist within destination"))?;
-            if metadata.file_type().is_symlink() {
-                return Err(invalid("hardlink target may not be a symlink"));
-            }
+            let source = hardlink_source
+                .as_ref()
+                .ok_or_else(|| invalid("hardlink source was not prepared"))?;
             fs::hard_link(source, output)?;
             summary.hardlinks = 1;
         }
@@ -596,6 +612,65 @@ fn ensure_safe_parents(root: &Path, relative: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn preflight_hardlink_source<R: Read>(
+    entry: &Entry<R>,
+    root: &Path,
+    output: &Path,
+    strip_components: usize,
+) -> Result<PathBuf> {
+    let target = entry
+        .header
+        .link_name()
+        .ok_or_else(|| invalid("hardlink lacks target"))?;
+    let relative = secure_relative_path(&target, strip_components)?
+        .ok_or_else(|| invalid("hardlink target was stripped away"))?;
+    let mut source = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        // A missing source is an error, never a reason to create its parents.
+        for component in parent.components() {
+            source.push(component);
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(invalid("hardlink target parent is not a safe directory"));
+            }
+        }
+    }
+    source = root.join(relative);
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.is_file() {
+        return Err(invalid("hardlink target must be an existing regular file"));
+    }
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => {
+            // Distinct hard links to one inode are safe; the same pathname is
+            // not, including filesystem case and Unicode aliases.
+            if fs::canonicalize(output)? == fs::canonicalize(&source)? {
+                return Err(invalid("hardlink target resolves to its output path"));
+            }
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Ok(source)
+}
+
+fn skip_existing_output(root: &Path, relative: &Path, overwrite: bool) -> Result<bool> {
+    if overwrite {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(root.join(relative)) {
+        Ok(_) => {
+            // An existing leaf does not authorize traversal through a symlinked
+            // parent. Its parents already exist, so this check creates none.
+            ensure_safe_parents(root, relative)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
