@@ -9,6 +9,9 @@ pub(super) fn parse_header(block: &[u8; 512]) -> Result<Header> {
     let magic = &block[257..263];
     let prefix = nul_bytes(&block[345..500]);
     if !prefix.is_empty() && magic == b"ustar\0" {
+        if &block[263..265] != b"00" {
+            return Err(invalid("noncanonical USTAR header cannot carry a prefix"));
+        }
         let mut combined = prefix.to_vec();
         combined.push(b'/');
         combined.extend_from_slice(&path);

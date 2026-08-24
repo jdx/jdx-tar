@@ -373,6 +373,18 @@ impl<R: Read> Entries<'_, R> {
             let flag = header.type_flag;
             let size = header.stored_size;
 
+            let identity = &block[257..265];
+            let is_ustar = identity == b"ustar\x0000";
+            let is_gnu = identity == b"ustar  \0";
+            if matches!(flag, b'x' | b'g') && !is_ustar {
+                return Err(invalid("PAX extension requires a USTAR carrier"));
+            }
+            if matches!(flag, b'L' | b'K') && !(is_ustar || is_gnu) {
+                return Err(invalid(
+                    "GNU long-name/link extension requires a USTAR or GNU carrier",
+                ));
+            }
+
             if matches!(flag, b'x' | b'g' | b'L' | b'K') {
                 if size > MAX_METADATA_SIZE {
                     return Err(error(
