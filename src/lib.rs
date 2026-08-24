@@ -362,6 +362,11 @@ impl<R: Read> Entries<'_, R> {
                 }
                 continue;
             }
+            if self.zero_blocks != 0 {
+                return Err(invalid(
+                    "tar zero block was not followed by a second zero block",
+                ));
+            }
             self.zero_blocks = 0;
             verify_checksum(&block)?;
             let mut header = parse_header(&block)?;
