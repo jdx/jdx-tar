@@ -237,6 +237,16 @@ pub(super) fn unpack_archive<R: Read>(
             });
             continue;
         }
+        if matches!(
+            entry.kind,
+            EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo
+        ) {
+            summary.skipped.push(SkippedEntry {
+                path: original,
+                reason: SkipReason::UnsupportedType,
+            });
+            continue;
+        }
         let output = root.join(&relative);
         ensure_safe_parents(&root, &relative)?;
         match entry.kind {
@@ -383,6 +393,16 @@ pub(super) fn unpack_entry<R: Read>(
         summary.skipped.push(SkippedEntry {
             path: original,
             reason: SkipReason::ReservedName,
+        });
+        return Ok(summary);
+    }
+    if matches!(
+        entry.kind,
+        EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo
+    ) {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::UnsupportedType,
         });
         return Ok(summary);
     }
