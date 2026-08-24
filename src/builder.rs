@@ -1,3 +1,4 @@
+use super::format::path_requires_directory;
 use super::{EntryType, Header, MAX_METADATA_SIZE, Result};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
@@ -45,6 +46,14 @@ impl<W: Write> Builder<W> {
         if path.is_empty() {
             return Err(invalid("tar entry path is empty"));
         }
+        validate_directory_suffix(&path, header.type_flag == b'5')?;
+        if let Some(target) = header
+            .link_name
+            .as_deref()
+            .filter(|_| header.type_flag == b'1')
+        {
+            validate_directory_suffix(target, false)?;
+        }
         header.path.clone_from(&path);
         if path.len() > NAME_LEN {
             long_record_size(&path)?;
@@ -81,9 +90,13 @@ impl<W: Write> Builder<W> {
         if path.is_empty() {
             return Err(invalid("tar entry path is empty"));
         }
+        validate_directory_suffix(&path, false)?;
         let target = path_bytes(target.as_ref());
         if target.is_empty() {
             return Err(invalid("tar link target is empty"));
+        }
+        if header.type_flag == b'1' {
+            validate_directory_suffix(&target, false)?;
         }
         header.link_name = Some(target);
         header.stored_size = 0;
@@ -185,6 +198,15 @@ impl<W: Write> Builder<W> {
         }
         result
     }
+}
+
+fn validate_directory_suffix(path: &[u8], is_directory: bool) -> Result<()> {
+    if !is_directory && path_requires_directory(path) {
+        return Err(invalid(
+            "only directory entries may have a directory-required path suffix",
+        ));
+    }
+    Ok(())
 }
 
 fn long_record_size(value: &[u8]) -> Result<u64> {

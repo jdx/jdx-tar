@@ -4,6 +4,13 @@ use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
 
+pub(super) fn path_requires_directory(path: &[u8]) -> bool {
+    let last_component = path
+        .rsplit(|byte| *byte == b'/')
+        .find(|part| !part.is_empty());
+    path.ends_with(b"/") || matches!(last_component, Some(b"." | b".."))
+}
+
 pub(super) fn parse_header(block: &[u8; 512]) -> Result<Header> {
     let mut path = nul_bytes(&block[..100]).to_vec();
     let magic = &block[257..263];

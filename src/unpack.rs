@@ -1,3 +1,4 @@
+use super::format::path_requires_directory;
 use super::{Archive, Entry, EntryType, Result, invalid};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -213,6 +214,7 @@ pub(super) fn unpack_archive<R: Read>(
     let mut entries = archive.entries()?;
     for item in &mut entries {
         let mut entry = item?;
+        validate_directory_suffixes(&entry)?;
         let original = entry.path()?.into_owned();
         if let Some(callback) = opts.on_entry.as_mut() {
             callback(&EntryInfo {
@@ -367,6 +369,7 @@ pub(super) fn unpack_entry<R: Read>(
     opts: &mut UnpackOptions,
     deferred_dirs: &mut Vec<(PathBuf, u32, i64)>,
 ) -> Result<UnpackSummary> {
+    validate_directory_suffixes(entry)?;
     let original = entry.path()?.into_owned();
     if let Some(callback) = opts.on_entry.as_mut() {
         callback(&EntryInfo {
@@ -512,6 +515,24 @@ pub(super) fn unpack_entry<R: Read>(
     }
     progress.boundary(entry.bytes_read());
     Ok(summary)
+}
+
+fn validate_directory_suffixes<R: Read>(entry: &Entry<R>) -> Result<()> {
+    if entry.kind != EntryType::Directory && path_requires_directory(&entry.header.path) {
+        return Err(invalid(
+            "only a directory may have a directory-required path suffix",
+        ));
+    }
+    if entry.kind == EntryType::Hardlink
+        && entry
+            .header
+            .link_name
+            .as_deref()
+            .is_some_and(path_requires_directory)
+    {
+        return Err(invalid("hardlink target requires a directory"));
+    }
+    Ok(())
 }
 
 fn secure_relative_path(path: &Path, strip: usize) -> Result<Option<PathBuf>> {
