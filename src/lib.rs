@@ -566,6 +566,7 @@ impl<R: Read> Entries<'_, R> {
                 logical_pos: 0,
                 sparse_index: 0,
                 generation,
+                extraction_started: false,
             }));
         }
     }
@@ -739,6 +740,7 @@ pub struct Entry<R: Read> {
     logical_pos: u64,
     sparse_index: usize,
     generation: u64,
+    extraction_started: bool,
 }
 
 impl<R: Read> Entry<R> {

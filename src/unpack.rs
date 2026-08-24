@@ -1,5 +1,5 @@
 use super::format::path_requires_directory;
-use super::{Archive, Entry, EntryType, Result, invalid};
+use super::{Archive, Entry, EntryType, Result, error, invalid};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -143,7 +143,7 @@ impl<'a> EntryUnpacker<'a> {
     ///
     /// Returns an error for an unsafe path, malformed link target, truncated
     /// data, callback-independent I/O failure, or filesystem extraction
-    /// failure.
+    /// failure, or if the entry is stale, already read, or previously extracted.
     pub fn unpack<R: Read>(&mut self, entry: &mut Entry<R>) -> Result<UnpackSummary> {
         unpack_entry(entry, &self.root, self.opts, &mut self.deferred_dirs)
     }
@@ -369,6 +369,18 @@ pub(super) fn unpack_entry<R: Read>(
     opts: &mut UnpackOptions,
     deferred_dirs: &mut Vec<(PathBuf, u32, i64)>,
 ) -> Result<UnpackSummary> {
+    if entry.generation != entry.state.borrow().generation {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "entry is stale because iteration advanced",
+        ));
+    }
+    if entry.logical_pos != 0 || entry.extraction_started {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "entry was already read or extraction was started",
+        ));
+    }
     validate_directory_suffixes(entry)?;
     let original = entry.path()?.into_owned();
     if let Some(callback) = opts.on_entry.as_mut() {
@@ -416,6 +428,7 @@ pub(super) fn unpack_entry<R: Read>(
             if output.exists() && fs::symlink_metadata(&output)?.file_type().is_symlink() {
                 return Err(invalid("archive directory collides with symlink"));
             }
+            entry.extraction_started = true;
             fs::create_dir_all(&output)?;
             deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
             summary.dirs = 1;
@@ -428,6 +441,9 @@ pub(super) fn unpack_entry<R: Read>(
                 });
                 return Ok(summary);
             }
+            // Sparse copying and zero-sized entries do not advance logical_pos.
+            // Once output preparation succeeds, even a failed copy is consumed.
+            entry.extraction_started = true;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -463,6 +479,7 @@ pub(super) fn unpack_entry<R: Read>(
                 });
                 return Ok(summary);
             }
+            entry.extraction_started = true;
             let target = entry
                 .header
                 .link_name()
@@ -492,6 +509,7 @@ pub(super) fn unpack_entry<R: Read>(
                 });
                 return Ok(summary);
             }
+            entry.extraction_started = true;
             let target = entry
                 .header
                 .link_name()
