@@ -171,9 +171,6 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
     if let Some(size) = pax_u64_checked(pax, "size")? {
         header.stored_size = size;
     }
-    if let Some(mode) = pax_u64_checked(pax, "mode")? {
-        header.mode = u32::try_from(mode).map_err(|_| invalid("PAX mode is too large"))?;
-    }
     if let Some(uid) = pax_u64_checked(pax, "uid")? {
         header.uid = uid;
     }
