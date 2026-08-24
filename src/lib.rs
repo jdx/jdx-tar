@@ -350,7 +350,7 @@ impl<R: Read> Entries<'_, R> {
                 let mut first = [0_u8; 1];
                 let n = state.read_counted(&mut first)?;
                 if n == 0 {
-                    return Ok(None);
+                    return self.finish_stream();
                 }
                 block[0] = first[0];
                 state.read_exact_counted(&mut block[1..])?;
@@ -358,7 +358,7 @@ impl<R: Read> Entries<'_, R> {
             if block.iter().all(|byte| *byte == 0) {
                 self.zero_blocks += 1;
                 if self.zero_blocks == 2 {
-                    return Ok(None);
+                    return self.finish_stream();
                 }
                 continue;
             }
@@ -474,6 +474,13 @@ impl<R: Read> Entries<'_, R> {
                 generation,
             }));
         }
+    }
+
+    fn finish_stream(&self) -> Result<Option<Entry<R>>> {
+        if self.local_pax.is_some() || self.long_name.is_some() || self.long_link.is_some() {
+            return Err(invalid("extension entry was not followed by a member"));
+        }
+        Ok(None)
     }
 
     fn read_metadata(&self, size: u64) -> Result<Vec<u8>> {
