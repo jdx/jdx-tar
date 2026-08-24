@@ -384,7 +384,15 @@ impl<R: Read> Entries<'_, R> {
                         self.local_pax = Some(parse_pax(&payload)?);
                     }
                     b'g' => {
-                        for (key, value) in parse_pax(&payload)? {
+                        let records = parse_pax(&payload)?;
+                        // Sparse metadata describes one member, not an inherited default.
+                        if records
+                            .iter()
+                            .any(|(key, _)| key.starts_with("GNU.sparse."))
+                        {
+                            return Err(invalid("GNU sparse PAX metadata is not valid globally"));
+                        }
+                        for (key, value) in records {
                             if value.is_empty() {
                                 self.global_pax.remove(&key);
                             } else {
