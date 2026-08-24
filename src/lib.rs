@@ -900,7 +900,7 @@ impl<R: Read> Entry<R> {
                 }
                 file.write_all(&buf[..n])?;
                 remaining -= n as u64;
-                progress.update(self.bytes_read());
+                progress.update(self.bytes_read())?;
             }
         }
         Ok(())

@@ -111,6 +111,7 @@ impl Default for UnpackOptions {
 #[must_use = "call finish() to apply deferred directory metadata"]
 pub struct EntryUnpacker<'a> {
     root: PathBuf,
+    root_identity: RootIdentity,
     opts: &'a mut UnpackOptions,
     deferred_dirs: Vec<DeferredDirectory>,
 }
@@ -139,6 +140,38 @@ impl DeferredDirectory {
     }
 }
 
+pub(super) struct RootIdentity {
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl RootIdentity {
+    fn capture(root: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir() {
+            return Err(invalid("extraction root is not a directory"));
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    fn check(&self, root: &Path) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = self;
+        let metadata = fs::symlink_metadata(root)?;
+        #[cfg(unix)]
+        let identity_matches = (metadata.dev(), metadata.ino()) == self.identity;
+        #[cfg(not(unix))]
+        let identity_matches = true;
+        if !metadata.is_dir() || !identity_matches || fs::canonicalize(root)?.as_path() != root {
+            return Err(invalid("extraction root changed during unpack"));
+        }
+        Ok(())
+    }
+}
+
 impl<'a> EntryUnpacker<'a> {
     /// Creates a per-entry extractor rooted at `dest`.
     ///
@@ -152,8 +185,11 @@ impl<'a> EntryUnpacker<'a> {
         if fs::symlink_metadata(dest)?.file_type().is_symlink() {
             return Err(invalid("destination may not be a symlink"));
         }
+        let root = fs::canonicalize(dest)?;
+        let root_identity = RootIdentity::capture(&root)?;
         Ok(Self {
-            root: fs::canonicalize(dest)?,
+            root,
+            root_identity,
             opts,
             deferred_dirs: Vec::new(),
         })
@@ -171,7 +207,13 @@ impl<'a> EntryUnpacker<'a> {
     /// data, callback-independent I/O failure, or filesystem extraction
     /// failure, or if the entry is stale, already read, or previously extracted.
     pub fn unpack<R: Read>(&mut self, entry: &mut Entry<R>) -> Result<UnpackSummary> {
-        unpack_entry(entry, &self.root, self.opts, &mut self.deferred_dirs)
+        unpack_entry(
+            entry,
+            &self.root,
+            &self.root_identity,
+            self.opts,
+            &mut self.deferred_dirs,
+        )
     }
 
     /// Applies deferred directory metadata and completes extraction.
@@ -181,6 +223,7 @@ impl<'a> EntryUnpacker<'a> {
     /// Returns an error when directory permissions or modification times
     /// cannot be restored.
     pub fn finish(self) -> Result<()> {
+        self.root_identity.check(&self.root)?;
         apply_deferred_directory_metadata(
             self.deferred_dirs,
             self.opts.preserve_permissions,
@@ -192,24 +235,30 @@ impl<'a> EntryUnpacker<'a> {
 pub(super) struct ProgressReporter<'a> {
     callback: &'a mut Option<ProgressCallback>,
     last: u64,
+    root_guard: Option<(&'a Path, &'a RootIdentity)>,
 }
 
 impl ProgressReporter<'_> {
-    pub(super) fn update(&mut self, current: u64) {
+    pub(super) fn update(&mut self, current: u64) -> Result<()> {
         if current.saturating_sub(self.last) >= 64 * 1024 {
-            self.fire(current);
+            self.fire(current)?;
         }
+        Ok(())
     }
-    fn boundary(&mut self, current: u64) {
-        self.fire(current);
+    fn boundary(&mut self, current: u64) -> Result<()> {
+        self.fire(current)
     }
-    fn fire(&mut self, current: u64) {
+    fn fire(&mut self, current: u64) -> Result<()> {
         if let Some(callback) = self.callback.as_mut() {
             callback(Progress {
                 bytes_read: current,
             });
+            if let Some((root, identity)) = self.root_guard {
+                identity.check(root)?;
+            }
         }
         self.last = current;
+        Ok(())
     }
 }
 
@@ -225,6 +274,7 @@ pub(super) fn unpack_archive<R: Read>(
         return Err(invalid("destination may not be a symlink"));
     }
     let root = fs::canonicalize(dest)?;
+    let root_identity = RootIdentity::capture(&root)?;
     let mut summary = UnpackSummary::default();
     let mut deferred_dirs = Vec::new();
     let preserve_permissions = opts.preserve_permissions;
@@ -232,10 +282,12 @@ pub(super) fn unpack_archive<R: Read>(
     let mut progress = ProgressReporter {
         callback: &mut opts.on_progress,
         last: 0,
+        root_guard: Some((&root, &root_identity)),
     };
     for item in &mut entries {
         let mut entry = item?;
         validate_directory_suffixes(&entry)?;
+        root_identity.check(&root)?;
         let original = entry.path()?.into_owned();
         if let Some(callback) = opts.on_entry.as_mut() {
             callback(&EntryInfo {
@@ -244,8 +296,9 @@ pub(super) fn unpack_archive<R: Read>(
                 size: entry.logical_size,
                 sparse: entry.sparse.is_some(),
             });
+            root_identity.check(&root)?;
         }
-        progress.boundary(entry.bytes_read());
+        progress.boundary(entry.bytes_read())?;
         let Some(relative) = secure_relative_path(&original, opts.strip_components)? else {
             summary.skipped.push(SkippedEntry {
                 path: original,
@@ -343,9 +396,10 @@ pub(super) fn unpack_archive<R: Read>(
                             break;
                         }
                         file.write_all(&buf[..n])?;
-                        progress.update(entry.bytes_read());
+                        progress.update(entry.bytes_read())?;
                     }
                 }
+                root_identity.check(&root)?;
                 apply_file_metadata(
                     &file,
                     entry.header.mode,
@@ -406,10 +460,11 @@ pub(super) fn unpack_archive<R: Read>(
                 reason: SkipReason::UnsupportedType,
             }),
         }
-        progress.boundary(entry.bytes_read());
+        progress.boundary(entry.bytes_read())?;
     }
+    root_identity.check(&root)?;
     apply_deferred_directory_metadata(deferred_dirs, preserve_permissions, preserve_mtime)?;
-    progress.boundary(archive.state.borrow().raw_bytes);
+    progress.boundary(archive.state.borrow().raw_bytes)?;
     Ok(summary)
 }
 
@@ -417,6 +472,7 @@ pub(super) fn unpack_archive<R: Read>(
 pub(super) fn unpack_entry<R: Read>(
     entry: &mut Entry<R>,
     root: &Path,
+    root_identity: &RootIdentity,
     opts: &mut UnpackOptions,
     deferred_dirs: &mut Vec<DeferredDirectory>,
 ) -> Result<UnpackSummary> {
@@ -433,6 +489,7 @@ pub(super) fn unpack_entry<R: Read>(
         ));
     }
     validate_directory_suffixes(entry)?;
+    root_identity.check(root)?;
     let original = entry.path()?.into_owned();
     if let Some(callback) = opts.on_entry.as_mut() {
         callback(&EntryInfo {
@@ -441,13 +498,15 @@ pub(super) fn unpack_entry<R: Read>(
             size: entry.logical_size,
             sparse: entry.sparse.is_some(),
         });
+        root_identity.check(root)?;
     }
     let mut summary = UnpackSummary::default();
     let mut progress = ProgressReporter {
         callback: &mut opts.on_progress,
         last: 0,
+        root_guard: Some((root, root_identity)),
     };
-    progress.boundary(entry.bytes_read());
+    progress.boundary(entry.bytes_read())?;
     let Some(relative) = secure_relative_path(&original, opts.strip_components)? else {
         summary.skipped.push(SkippedEntry {
             path: original,
@@ -549,9 +608,10 @@ pub(super) fn unpack_entry<R: Read>(
                         break;
                     }
                     file.write_all(&buf[..n])?;
-                    progress.update(entry.bytes_read());
+                    progress.update(entry.bytes_read())?;
                 }
             }
+            root_identity.check(root)?;
             apply_file_metadata(
                 &file,
                 entry.header.mode,
@@ -616,7 +676,7 @@ pub(super) fn unpack_entry<R: Read>(
             reason: SkipReason::UnsupportedType,
         }),
     }
-    progress.boundary(entry.bytes_read());
+    progress.boundary(entry.bytes_read())?;
     Ok(summary)
 }
 
@@ -994,11 +1054,12 @@ mod tests {
         let mut reporter = ProgressReporter {
             callback: &mut callback,
             last: 0,
+            root_guard: None,
         };
-        reporter.update(64 * 1024 - 1);
+        reporter.update(64 * 1024 - 1).unwrap();
         assert!(seen.borrow().is_empty());
-        reporter.update(64 * 1024);
-        reporter.boundary(70 * 1024);
+        reporter.update(64 * 1024).unwrap();
+        reporter.boundary(70 * 1024).unwrap();
         assert_eq!(*seen.borrow(), [64 * 1024, 70 * 1024]);
     }
 
