@@ -27,42 +27,66 @@ impl<W: Write> Builder<W> {
         }
     }
 
-    /// Appends an entry at `path`.
+    /// Appends a logical entry at `path`.
     ///
     /// Exactly `header.stored_size()` bytes are read from `data`. Paths longer
-    /// than the GNU header field are emitted using a GNU long-name record.
+    /// than the GNU header field are emitted using a GNU long-name record. Raw
+    /// extension and sparse headers are not accepted through this entry API.
     ///
     /// # Errors
     ///
     /// Returns an error when the path or header cannot be represented, the
-    /// input is shorter than its declared size, or writing fails.
+    /// entry type or payload shape is unsupported, the input is shorter than its
+    /// declared size, or writing fails. The caller header changes only on success.
     pub fn append_data<P: AsRef<Path>, R: Read>(
         &mut self,
         header: &mut Header,
         path: P,
         data: R,
     ) -> Result<()> {
+        self.ensure_writable()?;
+        if matches!(header.type_flag, b'x' | b'g' | b'L' | b'K' | b'S') {
+            return Err(invalid(
+                "raw extension and sparse headers are not logical writer entries",
+            ));
+        }
+        if matches!(header.type_flag, b'1'..=b'6') && header.stored_size != 0 {
+            return Err(invalid("nonregular entries cannot carry payload"));
+        }
+        let link_target = if matches!(header.type_flag, b'1' | b'2') {
+            let target = header
+                .link_name
+                .as_deref()
+                .ok_or_else(|| invalid("tar link target is missing"))?;
+            validate_name(target, "tar link target is empty or contains NUL")?;
+            if target.len() > LINK_LEN {
+                long_record_size(target)?;
+            }
+            if header.type_flag == b'1' {
+                validate_directory_suffix(target, false)?;
+            }
+            Some(target)
+        } else {
+            None
+        };
         let path = path_bytes(path.as_ref());
-        if path.is_empty() {
-            return Err(invalid("tar entry path is empty"));
-        }
+        validate_name(&path, "tar entry path is empty or contains NUL")?;
         validate_directory_suffix(&path, header.type_flag == b'5')?;
-        if let Some(target) = header
-            .link_name
-            .as_deref()
-            .filter(|_| header.type_flag == b'1')
-        {
-            validate_directory_suffix(target, false)?;
-        }
-        header.path.clone_from(&path);
         if path.len() > NAME_LEN {
             long_record_size(&path)?;
         }
-        encode_header(header)?;
+        let mut resolved = header.clone();
+        resolved.path.clone_from(&path);
+        encode_header(&resolved)?;
+        if let Some(target) = link_target.filter(|target| target.len() > LINK_LEN) {
+            self.append_long_record(b'K', target)?;
+        }
         if path.len() > NAME_LEN {
             self.append_long_record(b'L', &path)?;
         }
-        self.append_resolved(header, data)
+        self.append_resolved(&resolved, data)?;
+        *header = resolved;
+        Ok(())
     }
 
     /// Appends a symbolic or hard link.
@@ -80,6 +104,7 @@ impl<W: Write> Builder<W> {
         path: P,
         target: T,
     ) -> Result<()> {
+        self.ensure_writable()?;
         if !matches!(
             EntryType::from_flag(header.type_flag),
             EntryType::Symlink | EntryType::Hardlink
@@ -87,21 +112,18 @@ impl<W: Write> Builder<W> {
             return Err(invalid("append_link requires a symlink or hardlink header"));
         }
         let path = path_bytes(path.as_ref());
-        if path.is_empty() {
-            return Err(invalid("tar entry path is empty"));
-        }
+        validate_name(&path, "tar entry path is empty or contains NUL")?;
         validate_directory_suffix(&path, false)?;
         let target = path_bytes(target.as_ref());
-        if target.is_empty() {
-            return Err(invalid("tar link target is empty"));
-        }
+        validate_name(&target, "tar link target is empty or contains NUL")?;
         if header.type_flag == b'1' {
             validate_directory_suffix(&target, false)?;
         }
-        header.link_name = Some(target);
-        header.stored_size = 0;
-        header.path.clone_from(&path);
-        if let Some(target) = header
+        let mut resolved = header.clone();
+        resolved.link_name = Some(target);
+        resolved.stored_size = 0;
+        resolved.path.clone_from(&path);
+        if let Some(target) = resolved
             .link_name
             .as_deref()
             .filter(|target| target.len() > LINK_LEN)
@@ -111,8 +133,8 @@ impl<W: Write> Builder<W> {
         if path.len() > NAME_LEN {
             long_record_size(&path)?;
         }
-        encode_header(header)?;
-        if let Some(target) = header
+        encode_header(&resolved)?;
+        if let Some(target) = resolved
             .link_name
             .as_deref()
             .filter(|target| target.len() > LINK_LEN)
@@ -122,7 +144,9 @@ impl<W: Write> Builder<W> {
         if path.len() > NAME_LEN {
             self.append_long_record(b'L', &path)?;
         }
-        self.append_resolved(header, io::empty())
+        self.append_resolved(&resolved, io::empty())?;
+        *header = resolved;
+        Ok(())
     }
 
     /// Writes the two zero blocks that terminate a tar archive.
@@ -169,13 +193,18 @@ impl<W: Write> Builder<W> {
         self.append_resolved(&header, data.as_slice())
     }
 
-    fn append_resolved<R: Read>(&mut self, header: &Header, mut data: R) -> Result<()> {
+    fn ensure_writable(&self) -> Result<()> {
         if self.poisoned {
             return Err(invalid("cannot append to a poisoned tar archive"));
         }
         if self.finished {
             return Err(invalid("cannot append to a finished tar archive"));
         }
+        Ok(())
+    }
+
+    fn append_resolved<R: Read>(&mut self, header: &Header, mut data: R) -> Result<()> {
+        self.ensure_writable()?;
         let block = encode_header(header)?;
         let result = (|| {
             self.inner.write_all(&block)?;
@@ -205,6 +234,13 @@ fn validate_directory_suffix(path: &[u8], is_directory: bool) -> Result<()> {
         return Err(invalid(
             "only directory entries may have a directory-required path suffix",
         ));
+    }
+    Ok(())
+}
+
+fn validate_name(value: &[u8], message: &'static str) -> Result<()> {
+    if value.is_empty() || value.contains(&0) {
+        return Err(invalid(message));
     }
     Ok(())
 }
