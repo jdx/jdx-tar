@@ -155,16 +155,11 @@ impl<'a> EntryUnpacker<'a> {
     /// Returns an error when directory permissions or modification times
     /// cannot be restored.
     pub fn finish(self) -> Result<()> {
-        for (path, mode, mtime) in self.deferred_dirs.into_iter().rev() {
-            apply_metadata(
-                &path,
-                mode,
-                mtime,
-                self.opts.preserve_permissions,
-                self.opts.preserve_mtime,
-            )?;
-        }
-        Ok(())
+        apply_deferred_directory_metadata(
+            self.deferred_dirs,
+            self.opts.preserve_permissions,
+            self.opts.preserve_mtime,
+        )
     }
 }
 
@@ -257,7 +252,11 @@ pub(super) fn unpack_archive<R: Read>(
                     return Err(invalid("archive directory collides with symlink"));
                 }
                 fs::create_dir_all(&output)?;
-                deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
+                deferred_dirs.push((
+                    fs::canonicalize(output)?,
+                    entry.header.mode,
+                    entry.header.mtime,
+                ));
                 summary.dirs += 1;
             }
             EntryType::File | EntryType::Other(_) => {
@@ -355,9 +354,7 @@ pub(super) fn unpack_archive<R: Read>(
         }
         progress.boundary(entry.bytes_read());
     }
-    for (path, mode, mtime) in deferred_dirs.into_iter().rev() {
-        apply_metadata(&path, mode, mtime, preserve_permissions, preserve_mtime)?;
-    }
+    apply_deferred_directory_metadata(deferred_dirs, preserve_permissions, preserve_mtime)?;
     progress.boundary(archive.state.borrow().raw_bytes);
     Ok(summary)
 }
@@ -430,7 +427,11 @@ pub(super) fn unpack_entry<R: Read>(
             }
             entry.extraction_started = true;
             fs::create_dir_all(&output)?;
-            deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
+            deferred_dirs.push((
+                fs::canonicalize(output)?,
+                entry.header.mode,
+                entry.header.mtime,
+            ));
             summary.dirs = 1;
         }
         EntryType::File | EntryType::Other(_) => {
@@ -608,6 +609,25 @@ fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(true),
         Err(err) => Err(err),
     }
+}
+
+fn apply_deferred_directory_metadata(
+    directories: Vec<(PathBuf, u32, i64)>,
+    preserve_permissions: bool,
+    preserve_mtime: bool,
+) -> Result<()> {
+    // Canonical paths coalesce case and Unicode aliases on filesystems that
+    // resolve those spellings to the same directory. The last member wins.
+    let mut latest = std::collections::BTreeMap::new();
+    for (path, mode, mtime) in directories {
+        latest.insert(path, (mode, mtime));
+    }
+    let mut directories: Vec<_> = latest.into_iter().collect();
+    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (path, (mode, mtime)) in directories {
+        apply_metadata(&path, mode, mtime, preserve_permissions, preserve_mtime)?;
+    }
+    Ok(())
 }
 
 fn apply_metadata(
