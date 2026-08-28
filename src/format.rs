@@ -4,11 +4,21 @@ use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
 
+pub(super) fn path_requires_directory(path: &[u8]) -> bool {
+    let last_component = path
+        .rsplit(|byte| *byte == b'/')
+        .find(|part| !part.is_empty());
+    path.ends_with(b"/") || matches!(last_component, Some(b"." | b".."))
+}
+
 pub(super) fn parse_header(block: &[u8; 512]) -> Result<Header> {
     let mut path = nul_bytes(&block[..100]).to_vec();
     let magic = &block[257..263];
     let prefix = nul_bytes(&block[345..500]);
     if !prefix.is_empty() && magic == b"ustar\0" {
+        if &block[263..265] != b"00" {
+            return Err(invalid("noncanonical USTAR header cannot carry a prefix"));
+        }
         let mut combined = prefix.to_vec();
         combined.push(b'/');
         combined.extend_from_slice(&path);
@@ -72,36 +82,41 @@ pub(super) fn parse_number(field: &[u8]) -> Result<u64> {
         }
         return Ok(value);
     }
-    let trimmed = field
+    let start = field
         .iter()
-        .copied()
-        .skip_while(|byte| matches!(byte, 0 | b' '))
-        .take_while(u8::is_ascii_digit)
-        .collect::<Vec<_>>();
-    if trimmed.is_empty() {
-        return Ok(0);
-    }
-    if trimmed.iter().any(|byte| !(b'0'..=b'7').contains(byte)) {
+        .position(|byte| *byte != b' ')
+        .unwrap_or(field.len());
+    let digits = field[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(field.len() - start);
+    let end = start + digits;
+    if field[end..].iter().any(|byte| !matches!(byte, 0 | b' '))
+        || field[start..end]
+            .iter()
+            .any(|byte| !(b'0'..=b'7').contains(byte))
+    {
         return Err(invalid("invalid octal numeric field"));
     }
-    trimmed.into_iter().try_fold(0_u64, |value, byte| {
+    field[start..end].iter().try_fold(0_u64, |value, byte| {
         value
             .checked_mul(8)
-            .and_then(|v| v.checked_add(u64::from(byte - b'0')))
+            .and_then(|v| v.checked_add(u64::from(*byte - b'0')))
             .ok_or_else(|| invalid("numeric field overflow"))
     })
 }
 
 pub(super) fn parse_signed_number(field: &[u8]) -> Result<i64> {
     if field.first().is_some_and(|byte| byte & 0x80 != 0) && field[0] & 0x40 != 0 {
+        let start = field.len().saturating_sub(8);
+        if field[..start].iter().any(|byte| *byte != 0xff)
+            || (start != 0 && field[start] & 0x80 == 0)
+        {
+            return Err(invalid("signed numeric field overflow"));
+        }
         let mut bytes = [0xff_u8; 8];
-        let source = if field.len() > 8 {
-            &field[field.len() - 8..]
-        } else {
-            field
-        };
+        let source = &field[start..];
         bytes[8 - source.len()..].copy_from_slice(source);
-        bytes[8 - source.len()] &= 0x7f;
         return Ok(i64::from_be_bytes(bytes));
     }
     i64::try_from(parse_number(field)?).map_err(|_| invalid("signed numeric field overflow"))
@@ -133,7 +148,7 @@ pub(super) fn parse_pax(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         if length == 0
             || cursor
                 .checked_add(length)
-                .is_none_or(|end| end > data.len())
+                .is_none_or(|end| end > data.len() || end < space + 1)
         {
             return Err(invalid("PAX record exceeds extension body"));
         }
@@ -162,13 +177,10 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
         header.path = path.to_vec();
     }
     if let Some(link) = pax_value(pax, "linkpath") {
-        header.link_name = Some(link.to_vec());
+        header.link_name = (!link.is_empty()).then(|| link.to_vec());
     }
     if let Some(size) = pax_u64_checked(pax, "size")? {
         header.stored_size = size;
-    }
-    if let Some(mode) = pax_u64_checked(pax, "mode")? {
-        header.mode = u32::try_from(mode).map_err(|_| invalid("PAX mode is too large"))?;
     }
     if let Some(uid) = pax_u64_checked(pax, "uid")? {
         header.uid = uid;
@@ -177,8 +189,7 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
         header.gid = gid;
     }
     if let Some(mtime) = pax_text_checked(pax, "mtime")? {
-        let integral = mtime.split('.').next().unwrap_or(mtime);
-        header.mtime = integral.parse().map_err(|_| invalid("invalid PAX mtime"))?;
+        header.mtime = parse_pax_mtime(mtime)?;
     }
     Ok(())
 }
@@ -234,7 +245,7 @@ pub(super) fn parse_sparse_pairs(
     let mut pairs = pax
         .iter()
         .filter(|(key, _)| matches!(key.as_str(), "GNU.sparse.offset" | "GNU.sparse.numbytes"));
-    let mut map = Vec::with_capacity(count);
+    let mut map = Vec::new();
     for _ in 0..count {
         let offset = pairs
             .next()
@@ -260,8 +271,13 @@ pub(super) fn push_sparse_pair(
     offset: &[u8],
     len: &[u8],
 ) -> Result<bool> {
-    if offset.first() == Some(&0) {
+    let offset_empty = offset.first() == Some(&0);
+    let len_empty = len.first() == Some(&0);
+    if offset_empty && len_empty {
         return Ok(false);
+    }
+    if offset_empty || len_empty {
+        return Err(invalid("partial old GNU sparse map entry"));
     }
     let offset = parse_number(offset)?;
     let len = parse_number(len)?;
@@ -300,7 +316,7 @@ pub(super) fn validate_sparse(
 }
 
 pub(super) fn trim_metadata(mut data: Vec<u8>) -> Vec<u8> {
-    while data.last().is_some_and(|byte| *byte == 0 || *byte == b'\n') {
+    while data.last() == Some(&0) {
         data.pop();
     }
     data
@@ -320,6 +336,29 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> Cow<'_, Path> {
 #[cfg(not(unix))]
 pub(super) fn bytes_to_path(bytes: &[u8]) -> Cow<'_, Path> {
     Cow::Owned(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+fn parse_pax_mtime(value: &str) -> Result<i64> {
+    let (integral, fraction) = match value.split_once('.') {
+        Some((integral, fraction))
+            if !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (integral, Some(fraction))
+        }
+        Some(_) => return Err(invalid("invalid PAX mtime")),
+        None => (value, None),
+    };
+    let negative = integral.starts_with('-');
+    let seconds = integral
+        .parse::<i64>()
+        .map_err(|_| invalid("invalid PAX mtime"))?;
+    if negative && fraction.is_some_and(|fraction| fraction.bytes().any(|byte| byte != b'0')) {
+        seconds
+            .checked_sub(1)
+            .ok_or_else(|| invalid("PAX mtime is out of range"))
+    } else {
+        Ok(seconds)
+    }
 }
 
 #[cfg(test)]

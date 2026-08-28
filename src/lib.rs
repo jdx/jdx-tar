@@ -9,7 +9,7 @@ mod unpack;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -31,6 +31,24 @@ use unpack::{ProgressReporter, unpack_archive};
 const BLOCK: u64 = 512;
 const MAX_METADATA_SIZE: u64 = 1024 * 1024;
 const MAX_SPARSE_SEGMENTS: usize = 1_000_000;
+const PAX_HEADER_KEYS: [&str; 7] = ["path", "linkpath", "size", "mode", "uid", "gid", "mtime"];
+type PaxRecords = Vec<(String, Vec<u8>)>;
+
+struct PaxLayer {
+    parent: Option<Rc<Self>>,
+    records: BTreeMap<String, Vec<u8>>,
+}
+
+impl Drop for PaxLayer {
+    fn drop(&mut self) {
+        // Retained entries can keep a long update chain alive. Release uniquely
+        // owned ancestors iteratively rather than recursively dropping it.
+        let mut parent = self.parent.take();
+        while let Some(mut layer) = parent {
+            parent = Rc::get_mut(&mut layer).and_then(|layer| layer.parent.take());
+        }
+    }
+}
 
 /// The crate's result type.
 pub type Result<T> = io::Result<T>;
@@ -276,13 +294,21 @@ impl<R: Read> Archive<R> {
     ///
     /// # Errors
     ///
-    /// Reserved for reader initialization errors in future versions.
+    /// Returns an error if a previous iterator has consumed archive bytes.
     pub fn entries(&mut self) -> Result<Entries<'_, R>> {
+        if self.state.borrow().raw_bytes != 0 {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "cannot restart entry iteration after consuming archive bytes",
+            ));
+        }
         Ok(Entries {
             state: Rc::clone(&self.state),
             done: false,
             zero_blocks: 0,
             global_pax: BTreeMap::new(),
+            pending_global_pax_bytes: 0,
+            global_pax_snapshot: None,
             local_pax: None,
             long_name: None,
             long_link: None,
@@ -311,6 +337,8 @@ pub struct Entries<'a, R: Read> {
     done: bool,
     zero_blocks: u8,
     global_pax: BTreeMap<String, Vec<u8>>,
+    pending_global_pax_bytes: u64,
+    global_pax_snapshot: Option<Rc<PaxLayer>>,
     local_pax: Option<Vec<(String, Vec<u8>)>>,
     long_name: Option<Vec<u8>>,
     long_link: Option<Vec<u8>>,
@@ -350,7 +378,7 @@ impl<R: Read> Entries<'_, R> {
                 let mut first = [0_u8; 1];
                 let n = state.read_counted(&mut first)?;
                 if n == 0 {
-                    return Ok(None);
+                    return self.finish_stream();
                 }
                 block[0] = first[0];
                 state.read_exact_counted(&mut block[1..])?;
@@ -358,9 +386,14 @@ impl<R: Read> Entries<'_, R> {
             if block.iter().all(|byte| *byte == 0) {
                 self.zero_blocks += 1;
                 if self.zero_blocks == 2 {
-                    return Ok(None);
+                    return self.finish_stream();
                 }
                 continue;
+            }
+            if self.zero_blocks != 0 {
+                return Err(invalid(
+                    "tar zero block was not followed by a second zero block",
+                ));
             }
             self.zero_blocks = 0;
             verify_checksum(&block)?;
@@ -368,12 +401,34 @@ impl<R: Read> Entries<'_, R> {
             let flag = header.type_flag;
             let size = header.stored_size;
 
+            let identity = &block[257..265];
+            let is_ustar = identity == b"ustar\x0000";
+            let is_gnu = identity == b"ustar  \0";
+            if matches!(flag, b'x' | b'g') && !is_ustar {
+                return Err(invalid("PAX extension requires a USTAR carrier"));
+            }
+            if matches!(flag, b'L' | b'K') && !(is_ustar || is_gnu) {
+                return Err(invalid(
+                    "GNU long-name/link extension requires a USTAR or GNU carrier",
+                ));
+            }
+
             if matches!(flag, b'x' | b'g' | b'L' | b'K') {
                 if size > MAX_METADATA_SIZE {
                     return Err(error(
                         ErrorKind::InvalidData,
                         "tar metadata exceeds 1 MiB limit",
                     ));
+                }
+                if flag == b'g' {
+                    let total = self
+                        .pending_global_pax_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| invalid("global PAX metadata size overflow"))?;
+                    if total > MAX_METADATA_SIZE {
+                        return Err(invalid("pending global PAX metadata exceeds 1 MiB limit"));
+                    }
+                    self.pending_global_pax_bytes = total;
                 }
                 let payload = self.read_metadata(size)?;
                 match flag {
@@ -384,46 +439,113 @@ impl<R: Read> Entries<'_, R> {
                         self.local_pax = Some(parse_pax(&payload)?);
                     }
                     b'g' => {
-                        for (key, value) in parse_pax(&payload)? {
-                            if value.is_empty() {
-                                self.global_pax.remove(&key);
-                            } else {
-                                self.global_pax.insert(key, value);
-                            }
+                        let records = parse_pax(&payload)?;
+                        // Sparse metadata describes one member, not an inherited default.
+                        if records
+                            .iter()
+                            .any(|(key, _)| key.starts_with("GNU.sparse."))
+                        {
+                            return Err(invalid("GNU sparse PAX metadata is not valid globally"));
+                        }
+                        for (key, value) in &records {
+                            self.global_pax.insert(key.clone(), value.clone());
+                        }
+                        if let Some(layer) = self.global_pax_snapshot.as_mut().and_then(Rc::get_mut)
+                        {
+                            layer.records.extend(records);
+                        } else {
+                            self.global_pax_snapshot = Some(Rc::new(PaxLayer {
+                                parent: self.global_pax_snapshot.take(),
+                                records: records.into_iter().collect(),
+                            }));
                         }
                     }
-                    b'L' => self.long_name = Some(trim_metadata(payload)),
-                    b'K' => self.long_link = Some(trim_metadata(payload)),
+                    b'L' => {
+                        if self.long_name.is_some() {
+                            return Err(invalid("two GNU long-name headers describe one entry"));
+                        }
+                        self.long_name = Some(trim_metadata(payload));
+                    }
+                    b'K' => {
+                        if self.long_link.is_some() {
+                            return Err(invalid("two GNU long-link headers describe one entry"));
+                        }
+                        self.long_link = Some(trim_metadata(payload));
+                    }
                     _ => unreachable!(),
                 }
                 continue;
             }
 
-            let mut pax: Vec<(String, Vec<u8>)> = self
-                .global_pax
+            let pax_global = self.global_pax_snapshot.clone();
+            let pax_local = self.local_pax.take().unwrap_or_default();
+            let pax_local_keys = pax_local
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if let Some(local) = self.local_pax.take() {
-                pax.retain(|(existing, _)| !local.iter().any(|(key, _)| key == existing));
-                pax.extend(local.into_iter().filter(|(_, value)| !value.is_empty()));
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
+
+            // Resolve only fields used by header/sparse interpretation. Other
+            // global records remain shared until a caller requests them.
+            let mut pax = Vec::new();
+            for key in PAX_HEADER_KEYS {
+                if let Some(value) = self
+                    .global_pax
+                    .get(key)
+                    .filter(|_| !pax_local_keys.contains(key))
+                {
+                    pax.push((key.to_owned(), value.clone()));
+                }
             }
+            for (key, value) in self.global_pax.range("GNU.sparse.".to_owned()..) {
+                if !key.starts_with("GNU.sparse.") {
+                    break;
+                }
+                if !pax_local_keys.contains(key) {
+                    pax.push((key.clone(), value.clone()));
+                }
+            }
+            pax.extend(
+                pax_local
+                    .iter()
+                    .filter(|(key, _)| {
+                        PAX_HEADER_KEYS.contains(&key.as_str()) || key.starts_with("GNU.sparse.")
+                    })
+                    .cloned(),
+            );
+            if self.long_name.is_some()
+                && pax_value(&pax, "path").is_some_and(|path| !path.is_empty())
+            {
+                return Err(invalid(
+                    "PAX path and GNU long-name describe the same entry",
+                ));
+            }
+            if self.long_link.is_some()
+                && pax_value(&pax, "linkpath").is_some_and(|link| !link.is_empty())
+            {
+                return Err(invalid(
+                    "PAX linkpath and GNU long-link describe the same entry",
+                ));
+            }
+            apply_pax_header(&mut header, &pax)?;
             if let Some(name) = self.long_name.take() {
                 header.path = name;
             }
             if let Some(link) = self.long_link.take() {
                 header.link_name = Some(link);
             }
-            apply_pax_header(&mut header, &pax)?;
 
             // GNU sparse PAX archives use the tar header's size for the packed
             // body. Some writers (notably Go's archive/tar) also emit a PAX
             // `size` record containing the logical sparse size.
-            let physical_size = if pax.iter().any(|(key, _)| key.starts_with("GNU.sparse.")) {
-                size
-            } else {
-                header.stored_size
-            };
+            let pax_size = header.stored_size;
+            let has_pax_sparse = pax.iter().any(|(key, _)| key.starts_with("GNU.sparse."));
+            if has_pax_sparse && !matches!(flag, 0 | b'0' | b'7') {
+                return Err(invalid("GNU sparse PAX metadata requires a regular file"));
+            }
+            let physical_size = if has_pax_sparse { size } else { pax_size };
+            if matches!(flag, b'1'..=b'6') && (size != 0 || physical_size != 0) {
+                return Err(invalid("nonregular tar entry cannot carry payload"));
+            }
             header.stored_size = physical_size;
             let generation;
             {
@@ -438,22 +560,63 @@ impl<R: Read> Entries<'_, R> {
             } else {
                 self.parse_pax_sparse(&pax, physical_size)?
             };
+            if has_pax_sparse && pax_size != physical_size && pax_size != logical_size {
+                return Err(invalid(
+                    "GNU sparse PAX size conflicts with physical and logical sizes",
+                ));
+            }
             if let Some(name) = pax_value(&pax, "GNU.sparse.name") {
                 header.path = name.to_vec();
             }
+            if header.path.is_empty() && pax_value(&pax, "path").is_some_and(<[u8]>::is_empty) {
+                return Err(invalid("PAX path deletion leaves entry without a path"));
+            }
+            if matches!(flag, b'1' | b'2')
+                && pax_value(&pax, "linkpath").is_some_and(<[u8]>::is_empty)
+                && header.link_name.as_ref().is_none_or(Vec::is_empty)
+            {
+                return Err(invalid(
+                    "PAX linkpath deletion leaves link without a target",
+                ));
+            }
             let kind = EntryType::from_flag(flag);
+            if header.path.is_empty() {
+                return Err(invalid("tar entry has an empty effective path"));
+            }
+            if header.path.contains(&0) {
+                return Err(invalid("tar entry path contains a NUL byte"));
+            }
+            if matches!(kind, EntryType::Symlink | EntryType::Hardlink)
+                && header
+                    .link_name
+                    .as_ref()
+                    .is_none_or(|target| target.is_empty() || target.contains(&0))
+            {
+                return Err(invalid("tar link entry has an empty or NUL-bearing target"));
+            }
+            self.pending_global_pax_bytes = 0;
             return Ok(Some(Entry {
                 state: Rc::clone(&self.state),
                 header,
                 kind,
-                pax,
+                pax_global,
+                pax_local,
+                pax_local_keys,
                 sparse,
                 logical_size,
                 logical_pos: 0,
                 sparse_index: 0,
                 generation,
+                extraction_started: false,
             }));
         }
+    }
+
+    fn finish_stream(&self) -> Result<Option<Entry<R>>> {
+        if self.local_pax.is_some() || self.long_name.is_some() || self.long_link.is_some() {
+            return Err(invalid("extension entry was not followed by a member"));
+        }
+        Ok(None)
     }
 
     fn read_metadata(&self, size: u64) -> Result<Vec<u8>> {
@@ -481,7 +644,15 @@ impl<R: Read> Entries<'_, R> {
             }
         }
         let mut extended = block[482] != 0;
+        // Include the inline descriptors and each full continuation block.
+        let mut metadata_bytes = 96_u64;
         while extended {
+            metadata_bytes = metadata_bytes
+                .checked_add(BLOCK)
+                .ok_or_else(|| invalid("old GNU sparse metadata size overflow"))?;
+            if metadata_bytes > MAX_METADATA_SIZE {
+                return Err(invalid("old GNU sparse metadata exceeds 1 MiB limit"));
+            }
             let mut ext = [0_u8; 512];
             self.state.borrow_mut().read_exact_counted(&mut ext)?;
             for chunk in ext[..504].chunks_exact(24) {
@@ -511,6 +682,20 @@ impl<R: Read> Entries<'_, R> {
         let major = pax_text_checked(pax, "GNU.sparse.major")?;
         let minor = pax_text_checked(pax, "GNU.sparse.minor")?;
         if major == Some("1") && minor == Some("0") {
+            if pax.iter().any(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "GNU.sparse.map"
+                        | "GNU.sparse.numblocks"
+                        | "GNU.sparse.offset"
+                        | "GNU.sparse.numbytes"
+                        | "GNU.sparse.size"
+                )
+            }) {
+                return Err(invalid(
+                    "GNU sparse 1.0 metadata mixes sparse representations",
+                ));
+            }
             let logical = pax_u64_checked(pax, "GNU.sparse.realsize")?
                 .ok_or_else(|| invalid("PAX sparse 1.0 lacks GNU.sparse.realsize"))?;
             let (map, map_bytes) = self.read_sparse_1_0_map()?;
@@ -526,11 +711,33 @@ impl<R: Read> Entries<'_, R> {
                 "unsupported or contradictory GNU sparse PAX version",
             ));
         }
-        let logical = pax_u64_checked(pax, "GNU.sparse.size")?
-            .or(pax_u64_checked(pax, "GNU.sparse.realsize")?)
+        let size = pax_u64_checked(pax, "GNU.sparse.size")?;
+        let realsize = pax_u64_checked(pax, "GNU.sparse.realsize")?;
+        if size
+            .zip(realsize)
+            .is_some_and(|(size, realsize)| size != realsize)
+        {
+            return Err(invalid(
+                "GNU sparse PAX metadata has conflicting logical sizes",
+            ));
+        }
+        let logical = size
+            .or(realsize)
             .ok_or_else(|| invalid("GNU sparse PAX metadata lacks logical size"))?;
         let map = if let Some(value) = pax_text_checked(pax, "GNU.sparse.map")? {
-            parse_sparse_csv(value)?
+            if pax
+                .iter()
+                .any(|(key, _)| matches!(key.as_str(), "GNU.sparse.offset" | "GNU.sparse.numbytes"))
+            {
+                return Err(invalid("GNU sparse PAX metadata mixes maps and pairs"));
+            }
+            let map = parse_sparse_csv(value)?;
+            if pax_u64_checked(pax, "GNU.sparse.numblocks")?
+                .is_some_and(|count| usize::try_from(count).ok() != Some(map.len()))
+            {
+                return Err(invalid("GNU sparse PAX map count does not match"));
+            }
+            map
         } else if let Some(count) = pax_u64_checked(pax, "GNU.sparse.numblocks")? {
             parse_sparse_pairs(pax, count)?
         } else {
@@ -548,7 +755,7 @@ impl<R: Read> Entries<'_, R> {
         if count > MAX_SPARSE_SEGMENTS {
             return Err(invalid("sparse map has too many segments"));
         }
-        let mut map = Vec::with_capacity(count);
+        let mut map = Vec::new();
         for _ in 0..count {
             let offset = self.read_sparse_line(&mut consumed)?;
             let len = self.read_sparse_line(&mut consumed)?;
@@ -570,6 +777,9 @@ impl<R: Read> Entries<'_, R> {
     fn read_sparse_line(&self, consumed: &mut u64) -> Result<u64> {
         let mut digits = Vec::with_capacity(20);
         loop {
+            if *consumed >= MAX_METADATA_SIZE {
+                return Err(invalid("GNU sparse 1.0 metadata exceeds 1 MiB limit"));
+            }
             let mut byte = [0_u8; 1];
             let mut state = self.state.borrow_mut();
             if state.pending == 0 {
@@ -599,12 +809,15 @@ pub struct Entry<R: Read> {
     state: Rc<RefCell<ReaderState<R>>>,
     header: Header,
     kind: EntryType,
-    pax: Vec<(String, Vec<u8>)>,
+    pax_global: Option<Rc<PaxLayer>>,
+    pax_local: PaxRecords,
+    pax_local_keys: BTreeSet<String>,
     sparse: Option<Vec<SparseSegment>>,
     logical_size: u64,
     logical_pos: u64,
     sparse_index: usize,
     generation: u64,
+    extraction_started: bool,
 }
 
 impl<R: Read> Entry<R> {
@@ -638,9 +851,28 @@ impl<R: Read> Entry<R> {
     }
     /// Iterates over effective PAX key/value records.
     pub fn pax_extensions(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.pax
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_slice()))
+        let mut layers = Vec::new();
+        let mut layer = self.pax_global.as_deref();
+        while let Some(current) = layer {
+            layers.push(current);
+            layer = current.parent.as_deref();
+        }
+        let mut global = BTreeMap::new();
+        for layer in layers.into_iter().rev() {
+            for (key, value) in &layer.records {
+                if value.is_empty() {
+                    global.remove(key.as_str());
+                } else {
+                    global.insert(key.as_str(), value.as_slice());
+                }
+            }
+        }
+        global.retain(|key, _| !self.pax_local_keys.contains(*key));
+        global.into_iter().chain(
+            self.pax_local
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_slice())),
+        )
     }
     /// Returns cumulative raw bytes consumed from the underlying stream.
     #[must_use]
@@ -673,7 +905,7 @@ impl<R: Read> Entry<R> {
                 }
                 file.write_all(&buf[..n])?;
                 remaining -= n as u64;
-                progress.update(self.bytes_read());
+                progress.update(self.bytes_read())?;
             }
         }
         Ok(())
@@ -684,6 +916,12 @@ impl<R: Read> Read for Entry<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.logical_pos >= self.logical_size {
             return Ok(0);
+        }
+        if self.generation != self.state.borrow().generation {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "entry is stale because iteration advanced",
+            ));
         }
         let remaining = self.logical_size - self.logical_pos;
         let limit = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());

@@ -1,6 +1,9 @@
-use super::{Archive, Entry, EntryType, Result, invalid};
+use super::format::path_requires_directory;
+use super::{Archive, Entry, EntryType, Result, error, invalid};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Progress notification containing raw input bytes consumed.
@@ -108,8 +111,66 @@ impl Default for UnpackOptions {
 #[must_use = "call finish() to apply deferred directory metadata"]
 pub struct EntryUnpacker<'a> {
     root: PathBuf,
+    root_identity: RootIdentity,
     opts: &'a mut UnpackOptions,
-    deferred_dirs: Vec<(PathBuf, u32, i64)>,
+    deferred_dirs: Vec<DeferredDirectory>,
+}
+
+pub(super) struct DeferredDirectory {
+    path: PathBuf,
+    mode: u32,
+    mtime: i64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl DeferredDirectory {
+    fn new(path: PathBuf, mode: u32, mtime: i64) -> Result<Self> {
+        let path = fs::canonicalize(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(invalid("archive directory is not a directory"));
+        }
+        Ok(Self {
+            path,
+            mode,
+            mtime,
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+pub(super) struct RootIdentity {
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl RootIdentity {
+    fn capture(root: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir() {
+            return Err(invalid("extraction root is not a directory"));
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    fn check(&self, root: &Path) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = self;
+        let metadata = fs::symlink_metadata(root)?;
+        #[cfg(unix)]
+        let identity_matches = (metadata.dev(), metadata.ino()) == self.identity;
+        #[cfg(not(unix))]
+        let identity_matches = true;
+        if !metadata.is_dir() || !identity_matches || fs::canonicalize(root)?.as_path() != root {
+            return Err(invalid("extraction root changed during unpack"));
+        }
+        Ok(())
+    }
 }
 
 impl<'a> EntryUnpacker<'a> {
@@ -125,8 +186,11 @@ impl<'a> EntryUnpacker<'a> {
         if fs::symlink_metadata(dest)?.file_type().is_symlink() {
             return Err(invalid("destination may not be a symlink"));
         }
+        let root = fs::canonicalize(dest)?;
+        let root_identity = RootIdentity::capture(&root)?;
         Ok(Self {
-            root: fs::canonicalize(dest)?,
+            root,
+            root_identity,
             opts,
             deferred_dirs: Vec::new(),
         })
@@ -142,9 +206,15 @@ impl<'a> EntryUnpacker<'a> {
     ///
     /// Returns an error for an unsafe path, malformed link target, truncated
     /// data, callback-independent I/O failure, or filesystem extraction
-    /// failure.
+    /// failure, or if the entry is stale, already read, or previously extracted.
     pub fn unpack<R: Read>(&mut self, entry: &mut Entry<R>) -> Result<UnpackSummary> {
-        unpack_entry(entry, &self.root, self.opts, &mut self.deferred_dirs)
+        unpack_entry(
+            entry,
+            &self.root,
+            &self.root_identity,
+            self.opts,
+            &mut self.deferred_dirs,
+        )
     }
 
     /// Applies deferred directory metadata and completes extraction.
@@ -154,40 +224,42 @@ impl<'a> EntryUnpacker<'a> {
     /// Returns an error when directory permissions or modification times
     /// cannot be restored.
     pub fn finish(self) -> Result<()> {
-        for (path, mode, mtime) in self.deferred_dirs.into_iter().rev() {
-            apply_metadata(
-                &path,
-                mode,
-                mtime,
-                self.opts.preserve_permissions,
-                self.opts.preserve_mtime,
-            )?;
-        }
-        Ok(())
+        self.root_identity.check(&self.root)?;
+        apply_deferred_directory_metadata(
+            self.deferred_dirs,
+            self.opts.preserve_permissions,
+            self.opts.preserve_mtime,
+        )
     }
 }
 
 pub(super) struct ProgressReporter<'a> {
     callback: &'a mut Option<ProgressCallback>,
     last: u64,
+    root_guard: Option<(&'a Path, &'a RootIdentity)>,
 }
 
 impl ProgressReporter<'_> {
-    pub(super) fn update(&mut self, current: u64) {
+    pub(super) fn update(&mut self, current: u64) -> Result<()> {
         if current.saturating_sub(self.last) >= 64 * 1024 {
-            self.fire(current);
+            self.fire(current)?;
         }
+        Ok(())
     }
-    fn boundary(&mut self, current: u64) {
-        self.fire(current);
+    fn boundary(&mut self, current: u64) -> Result<()> {
+        self.fire(current)
     }
-    fn fire(&mut self, current: u64) {
+    fn fire(&mut self, current: u64) -> Result<()> {
         if let Some(callback) = self.callback.as_mut() {
             callback(Progress {
                 bytes_read: current,
             });
+            if let Some((root, identity)) = self.root_guard {
+                identity.check(root)?;
+            }
         }
         self.last = current;
+        Ok(())
     }
 }
 
@@ -197,11 +269,13 @@ pub(super) fn unpack_archive<R: Read>(
     dest: &Path,
     opts: &mut UnpackOptions,
 ) -> Result<UnpackSummary> {
+    let mut entries = archive.entries()?;
     fs::create_dir_all(dest)?;
     if fs::symlink_metadata(dest)?.file_type().is_symlink() {
         return Err(invalid("destination may not be a symlink"));
     }
     let root = fs::canonicalize(dest)?;
+    let root_identity = RootIdentity::capture(&root)?;
     let mut summary = UnpackSummary::default();
     let mut deferred_dirs = Vec::new();
     let preserve_permissions = opts.preserve_permissions;
@@ -209,10 +283,12 @@ pub(super) fn unpack_archive<R: Read>(
     let mut progress = ProgressReporter {
         callback: &mut opts.on_progress,
         last: 0,
+        root_guard: Some((&root, &root_identity)),
     };
-    let mut entries = archive.entries()?;
     for item in &mut entries {
         let mut entry = item?;
+        validate_directory_suffixes(&entry)?;
+        root_identity.check(&root)?;
         let original = entry.path()?.into_owned();
         if let Some(callback) = opts.on_entry.as_mut() {
             callback(&EntryInfo {
@@ -221,8 +297,9 @@ pub(super) fn unpack_archive<R: Read>(
                 size: entry.logical_size,
                 sparse: entry.sparse.is_some(),
             });
+            root_identity.check(&root)?;
         }
-        progress.boundary(entry.bytes_read());
+        progress.boundary(entry.bytes_read())?;
         let Some(relative) = secure_relative_path(&original, opts.strip_components)? else {
             summary.skipped.push(SkippedEntry {
                 path: original,
@@ -237,7 +314,52 @@ pub(super) fn unpack_archive<R: Read>(
             });
             continue;
         }
+        if matches!(
+            entry.kind,
+            EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo
+        ) {
+            summary.skipped.push(SkippedEntry {
+                path: original,
+                reason: SkipReason::UnsupportedType,
+            });
+            continue;
+        }
         let output = root.join(&relative);
+        if matches!(entry.kind, EntryType::Hardlink | EntryType::Symlink)
+            && skip_existing_output(&root, &relative, opts.overwrite)?
+        {
+            summary.skipped.push(SkippedEntry {
+                path: original,
+                reason: SkipReason::Exists,
+            });
+            continue;
+        }
+        let hardlink_source = if entry.kind == EntryType::Hardlink {
+            Some(preflight_hardlink_source(
+                &entry,
+                &root,
+                &output,
+                opts.strip_components,
+            )?)
+        } else {
+            None
+        };
+        validate_mtime_before_output(
+            entry.kind,
+            entry.header.mtime,
+            opts.preserve_mtime,
+            &output,
+            opts.overwrite,
+        )?;
+        if entry.kind == EntryType::File
+            && entry.sparse.is_some()
+            && entry.logical_size > i64::MAX as u64
+            && (opts.overwrite || fs::symlink_metadata(&output).is_err())
+        {
+            return Err(invalid(
+                "sparse output length exceeds the filesystem offset range",
+            ));
+        }
         ensure_safe_parents(&root, &relative)?;
         match entry.kind {
             EntryType::Directory => {
@@ -245,7 +367,11 @@ pub(super) fn unpack_archive<R: Read>(
                     return Err(invalid("archive directory collides with symlink"));
                 }
                 fs::create_dir_all(&output)?;
-                deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
+                deferred_dirs.push(DeferredDirectory::new(
+                    output,
+                    entry.header.mode,
+                    entry.header.mtime,
+                )?);
                 summary.dirs += 1;
             }
             EntryType::File => {
@@ -271,11 +397,12 @@ pub(super) fn unpack_archive<R: Read>(
                             break;
                         }
                         file.write_all(&buf[..n])?;
-                        progress.update(entry.bytes_read());
+                        progress.update(entry.bytes_read())?;
                     }
                 }
-                apply_metadata(
-                    &output,
+                root_identity.check(&root)?;
+                apply_file_metadata(
+                    &file,
                     entry.header.mode,
                     entry.header.mtime,
                     preserve_permissions,
@@ -284,19 +411,21 @@ pub(super) fn unpack_archive<R: Read>(
                 summary.files += 1;
             }
             EntryType::Symlink => {
-                if !prepare_output(&output, opts.overwrite)? {
-                    summary.skipped.push(SkippedEntry {
-                        path: original,
-                        reason: SkipReason::Exists,
-                    });
-                    continue;
-                }
                 let target = entry
                     .header
                     .link_name()
                     .ok_or_else(|| invalid("symlink lacks target"))?;
-                match create_symlink(&target, &output) {
-                    Ok(()) => summary.symlinks += 1,
+                match replace_output_with_link(&output, opts.overwrite, |path| {
+                    create_symlink(&target, path)
+                }) {
+                    Ok(true) => summary.symlinks += 1,
+                    Ok(false) => {
+                        summary.skipped.push(SkippedEntry {
+                            path: original,
+                            reason: SkipReason::Exists,
+                        });
+                        continue;
+                    }
                     Err(err)
                         if cfg!(windows)
                             && matches!(
@@ -313,27 +442,18 @@ pub(super) fn unpack_archive<R: Read>(
                 }
             }
             EntryType::Hardlink => {
-                if !prepare_output(&output, opts.overwrite)? {
+                let source = hardlink_source
+                    .as_ref()
+                    .ok_or_else(|| invalid("hardlink source was not prepared"))?;
+                if !replace_output_with_link(&output, opts.overwrite, |path| {
+                    fs::hard_link(source, path)
+                })? {
                     summary.skipped.push(SkippedEntry {
                         path: original,
                         reason: SkipReason::Exists,
                     });
                     continue;
                 }
-                let target = entry
-                    .header
-                    .link_name()
-                    .ok_or_else(|| invalid("hardlink lacks target"))?;
-                let target_relative = secure_relative_path(&target, opts.strip_components)?
-                    .ok_or_else(|| invalid("hardlink target was stripped away"))?;
-                ensure_safe_parents(&root, &target_relative)?;
-                let source = root.join(target_relative);
-                let metadata = fs::symlink_metadata(&source)
-                    .map_err(|_| invalid("hardlink target does not exist within destination"))?;
-                if metadata.file_type().is_symlink() {
-                    return Err(invalid("hardlink target may not be a symlink"));
-                }
-                fs::hard_link(source, output)?;
                 summary.hardlinks += 1;
             }
             _ => summary.skipped.push(SkippedEntry {
@@ -341,12 +461,11 @@ pub(super) fn unpack_archive<R: Read>(
                 reason: SkipReason::UnsupportedType,
             }),
         }
-        progress.boundary(entry.bytes_read());
+        progress.boundary(entry.bytes_read())?;
     }
-    for (path, mode, mtime) in deferred_dirs.into_iter().rev() {
-        apply_metadata(&path, mode, mtime, preserve_permissions, preserve_mtime)?;
-    }
-    progress.boundary(archive.state.borrow().raw_bytes);
+    root_identity.check(&root)?;
+    apply_deferred_directory_metadata(deferred_dirs, preserve_permissions, preserve_mtime)?;
+    progress.boundary(archive.state.borrow().raw_bytes)?;
     Ok(summary)
 }
 
@@ -354,9 +473,24 @@ pub(super) fn unpack_archive<R: Read>(
 pub(super) fn unpack_entry<R: Read>(
     entry: &mut Entry<R>,
     root: &Path,
+    root_identity: &RootIdentity,
     opts: &mut UnpackOptions,
-    deferred_dirs: &mut Vec<(PathBuf, u32, i64)>,
+    deferred_dirs: &mut Vec<DeferredDirectory>,
 ) -> Result<UnpackSummary> {
+    if entry.generation != entry.state.borrow().generation {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "entry is stale because iteration advanced",
+        ));
+    }
+    if entry.logical_pos != 0 || entry.extraction_started {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "entry was already read or extraction was started",
+        ));
+    }
+    validate_directory_suffixes(entry)?;
+    root_identity.check(root)?;
     let original = entry.path()?.into_owned();
     if let Some(callback) = opts.on_entry.as_mut() {
         callback(&EntryInfo {
@@ -365,13 +499,15 @@ pub(super) fn unpack_entry<R: Read>(
             size: entry.logical_size,
             sparse: entry.sparse.is_some(),
         });
+        root_identity.check(root)?;
     }
     let mut summary = UnpackSummary::default();
     let mut progress = ProgressReporter {
         callback: &mut opts.on_progress,
         last: 0,
+        root_guard: Some((root, root_identity)),
     };
-    progress.boundary(entry.bytes_read());
+    progress.boundary(entry.bytes_read())?;
     let Some(relative) = secure_relative_path(&original, opts.strip_components)? else {
         summary.skipped.push(SkippedEntry {
             path: original,
@@ -386,15 +522,65 @@ pub(super) fn unpack_entry<R: Read>(
         });
         return Ok(summary);
     }
+    if matches!(
+        entry.kind,
+        EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo
+    ) {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::UnsupportedType,
+        });
+        return Ok(summary);
+    }
     let output = root.join(&relative);
+    if matches!(entry.kind, EntryType::Hardlink | EntryType::Symlink)
+        && skip_existing_output(root, &relative, opts.overwrite)?
+    {
+        summary.skipped.push(SkippedEntry {
+            path: original,
+            reason: SkipReason::Exists,
+        });
+        return Ok(summary);
+    }
+    let hardlink_source = if entry.kind == EntryType::Hardlink {
+        Some(preflight_hardlink_source(
+            entry,
+            root,
+            &output,
+            opts.strip_components,
+        )?)
+    } else {
+        None
+    };
+    validate_mtime_before_output(
+        entry.kind,
+        entry.header.mtime,
+        opts.preserve_mtime,
+        &output,
+        opts.overwrite,
+    )?;
+    if entry.kind == EntryType::File
+        && entry.sparse.is_some()
+        && entry.logical_size > i64::MAX as u64
+        && (opts.overwrite || fs::symlink_metadata(&output).is_err())
+    {
+        return Err(invalid(
+            "sparse output length exceeds the filesystem offset range",
+        ));
+    }
     ensure_safe_parents(root, &relative)?;
     match entry.kind {
         EntryType::Directory => {
             if output.exists() && fs::symlink_metadata(&output)?.file_type().is_symlink() {
                 return Err(invalid("archive directory collides with symlink"));
             }
+            entry.extraction_started = true;
             fs::create_dir_all(&output)?;
-            deferred_dirs.push((output, entry.header.mode, entry.header.mtime));
+            deferred_dirs.push(DeferredDirectory::new(
+                output,
+                entry.header.mode,
+                entry.header.mtime,
+            )?);
             summary.dirs = 1;
         }
         EntryType::File => {
@@ -405,6 +591,9 @@ pub(super) fn unpack_entry<R: Read>(
                 });
                 return Ok(summary);
             }
+            // Sparse copying and zero-sized entries do not advance logical_pos.
+            // Once output preparation succeeds, even a failed copy is consumed.
+            entry.extraction_started = true;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -420,11 +609,12 @@ pub(super) fn unpack_entry<R: Read>(
                         break;
                     }
                     file.write_all(&buf[..n])?;
-                    progress.update(entry.bytes_read());
+                    progress.update(entry.bytes_read())?;
                 }
             }
-            apply_metadata(
-                &output,
+            root_identity.check(root)?;
+            apply_file_metadata(
+                &file,
                 entry.header.mode,
                 entry.header.mtime,
                 opts.preserve_permissions,
@@ -433,19 +623,24 @@ pub(super) fn unpack_entry<R: Read>(
             summary.files = 1;
         }
         EntryType::Symlink => {
-            if !prepare_output(&output, opts.overwrite)? {
-                summary.skipped.push(SkippedEntry {
-                    path: original,
-                    reason: SkipReason::Exists,
-                });
-                return Ok(summary);
-            }
             let target = entry
                 .header
                 .link_name()
                 .ok_or_else(|| invalid("symlink lacks target"))?;
-            match create_symlink(&target, &output) {
-                Ok(()) => summary.symlinks = 1,
+            match replace_output_with_link(&output, opts.overwrite, |path| {
+                create_symlink(&target, path)
+            }) {
+                Ok(true) => {
+                    entry.extraction_started = true;
+                    summary.symlinks = 1;
+                }
+                Ok(false) => {
+                    summary.skipped.push(SkippedEntry {
+                        path: original,
+                        reason: SkipReason::Exists,
+                    });
+                    return Ok(summary);
+                }
                 Err(err)
                     if cfg!(windows)
                         && matches!(
@@ -462,27 +657,19 @@ pub(super) fn unpack_entry<R: Read>(
             }
         }
         EntryType::Hardlink => {
-            if !prepare_output(&output, opts.overwrite)? {
+            let source = hardlink_source
+                .as_ref()
+                .ok_or_else(|| invalid("hardlink source was not prepared"))?;
+            if !replace_output_with_link(&output, opts.overwrite, |path| {
+                fs::hard_link(source, path)
+            })? {
                 summary.skipped.push(SkippedEntry {
                     path: original,
                     reason: SkipReason::Exists,
                 });
                 return Ok(summary);
             }
-            let target = entry
-                .header
-                .link_name()
-                .ok_or_else(|| invalid("hardlink lacks target"))?;
-            let target_relative = secure_relative_path(&target, opts.strip_components)?
-                .ok_or_else(|| invalid("hardlink target was stripped away"))?;
-            ensure_safe_parents(root, &target_relative)?;
-            let source = root.join(target_relative);
-            let metadata = fs::symlink_metadata(&source)
-                .map_err(|_| invalid("hardlink target does not exist within destination"))?;
-            if metadata.file_type().is_symlink() {
-                return Err(invalid("hardlink target may not be a symlink"));
-            }
-            fs::hard_link(source, output)?;
+            entry.extraction_started = true;
             summary.hardlinks = 1;
         }
         _ => summary.skipped.push(SkippedEntry {
@@ -490,8 +677,26 @@ pub(super) fn unpack_entry<R: Read>(
             reason: SkipReason::UnsupportedType,
         }),
     }
-    progress.boundary(entry.bytes_read());
+    progress.boundary(entry.bytes_read())?;
     Ok(summary)
+}
+
+fn validate_directory_suffixes<R: Read>(entry: &Entry<R>) -> Result<()> {
+    if entry.kind != EntryType::Directory && path_requires_directory(&entry.header.path) {
+        return Err(invalid(
+            "only a directory may have a directory-required path suffix",
+        ));
+    }
+    if entry.kind == EntryType::Hardlink
+        && entry
+            .header
+            .link_name
+            .as_deref()
+            .is_some_and(path_requires_directory)
+    {
+        return Err(invalid("hardlink target requires a directory"));
+    }
+    Ok(())
 }
 
 fn secure_relative_path(path: &Path, strip: usize) -> Result<Option<PathBuf>> {
@@ -538,6 +743,118 @@ fn ensure_safe_parents(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
+fn preflight_hardlink_source<R: Read>(
+    entry: &Entry<R>,
+    root: &Path,
+    output: &Path,
+    strip_components: usize,
+) -> Result<PathBuf> {
+    let target = entry
+        .header
+        .link_name()
+        .ok_or_else(|| invalid("hardlink lacks target"))?;
+    let relative = secure_relative_path(&target, strip_components)?
+        .ok_or_else(|| invalid("hardlink target was stripped away"))?;
+    let mut source = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        // A missing source is an error, never a reason to create its parents.
+        for component in parent.components() {
+            source.push(component);
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(invalid("hardlink target parent is not a safe directory"));
+            }
+        }
+    }
+    source = root.join(relative);
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.is_file() {
+        return Err(invalid("hardlink target must be an existing regular file"));
+    }
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => {
+            // Distinct hard links to one inode are safe; the same pathname is
+            // not, including filesystem case and Unicode aliases.
+            if fs::canonicalize(output)? == fs::canonicalize(&source)? {
+                return Err(invalid("hardlink target resolves to its output path"));
+            }
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Ok(source)
+}
+
+struct TemporaryLink(PathBuf);
+
+impl Drop for TemporaryLink {
+    fn drop(&mut self) {
+        // A successful rename normally removes this name. It can also be a
+        // no-op when both names already refer to the same hard-linked inode.
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn replace_output_with_link(
+    path: &Path,
+    overwrite: bool,
+    create: impl Fn(&Path) -> Result<()>,
+) -> Result<bool> {
+    static NEXT_LINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    match fs::symlink_metadata(path) {
+        Ok(_) if !overwrite => return Ok(false),
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(invalid("archive file collides with existing directory"));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            create(path)?;
+            return Ok(true);
+        }
+        Err(err) => return Err(err),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("link output has no parent directory"))?;
+    for _ in 0..128 {
+        let id = NEXT_LINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = parent.join(format!(".jdx-tar-{}-{id}.link", std::process::id()));
+        match create(&temporary) {
+            Ok(()) => {
+                let temporary = TemporaryLink(temporary);
+                // The destination is untouched until the OS has accepted the
+                // replacement link; a sibling rename commits the change.
+                fs::rename(&temporary.0, path)?;
+                return Ok(true);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "unable to reserve a temporary link name",
+    ))
+}
+
+fn skip_existing_output(root: &Path, relative: &Path, overwrite: bool) -> Result<bool> {
+    if overwrite {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(root.join(relative)) {
+        Ok(_) => {
+            // An existing leaf does not authorize traversal through a symlinked
+            // parent. Its parents already exist, so this check creates none.
+            ensure_safe_parents(root, relative)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_meta) if !overwrite => Ok(false),
@@ -551,8 +868,27 @@ fn prepare_output(path: &Path, overwrite: bool) -> Result<bool> {
     }
 }
 
-fn apply_metadata(
-    path: &Path,
+fn apply_deferred_directory_metadata(
+    directories: Vec<DeferredDirectory>,
+    preserve_permissions: bool,
+    preserve_mtime: bool,
+) -> Result<()> {
+    // Canonical paths coalesce case and Unicode aliases on filesystems that
+    // resolve those spellings to the same directory. The last member wins.
+    let mut latest = std::collections::BTreeMap::new();
+    for directory in directories {
+        latest.insert(directory.path.clone(), directory);
+    }
+    let mut directories: Vec<_> = latest.into_iter().collect();
+    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (_, directory) in directories {
+        apply_directory_metadata(&directory, preserve_permissions, preserve_mtime)?;
+    }
+    Ok(())
+}
+
+fn apply_file_metadata(
+    file: &fs::File,
     mode: u32,
     mtime: i64,
     preserve_permissions: bool,
@@ -563,11 +899,58 @@ fn apply_metadata(
     #[cfg(unix)]
     if preserve_permissions {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))?;
+        file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
     }
     if preserve_mtime {
         let time = filetime::FileTime::from_unix_time(mtime, 0);
-        filetime::set_file_mtime(path, time)?;
+        filetime::set_file_handle_times(file, None, Some(time))?;
+    }
+    Ok(())
+}
+
+fn apply_directory_metadata(
+    directory: &DeferredDirectory,
+    preserve_permissions: bool,
+    preserve_mtime: bool,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = directory.mode;
+    if !preserve_permissions && !preserve_mtime {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let metadata = {
+        let metadata = fs::symlink_metadata(&directory.path)?;
+        if !metadata.is_dir() || (metadata.dev(), metadata.ino()) != directory.identity {
+            return Err(invalid(
+                "archive directory changed before metadata restoration",
+            ));
+        }
+        metadata
+    };
+    #[cfg(unix)]
+    if preserve_permissions {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            &directory.path,
+            fs::Permissions::from_mode(directory.mode & 0o7777),
+        )?;
+    }
+    if preserve_mtime {
+        let time = filetime::FileTime::from_unix_time(directory.mtime, 0);
+        #[cfg(unix)]
+        {
+            // Restore time without reopening a directory whose archived mode
+            // can remove all access. The captured identity is checked after
+            // callbacks; concurrent tree mutation remains outside the contract.
+            filetime::set_symlink_file_times(
+                &directory.path,
+                filetime::FileTime::from_last_access_time(&metadata),
+                time,
+            )?;
+        }
+        #[cfg(not(unix))]
+        filetime::set_file_mtime(&directory.path, time)?;
     }
     Ok(())
 }
@@ -626,6 +1009,25 @@ fn is_reserved_path(_path: &Path) -> bool {
     false
 }
 
+fn validate_mtime_before_output(
+    kind: EntryType,
+    mtime: i64,
+    preserve_mtime: bool,
+    output: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    let skips_existing_file =
+        kind == EntryType::File && !overwrite && fs::symlink_metadata(output).is_ok();
+    if preserve_mtime
+        && matches!(kind, EntryType::File | EntryType::Directory)
+        && mtime == i64::MIN
+        && !skips_existing_file
+    {
+        return Err(invalid("tar mtime is too small to restore safely"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,11 +1055,12 @@ mod tests {
         let mut reporter = ProgressReporter {
             callback: &mut callback,
             last: 0,
+            root_guard: None,
         };
-        reporter.update(64 * 1024 - 1);
+        reporter.update(64 * 1024 - 1).unwrap();
         assert!(seen.borrow().is_empty());
-        reporter.update(64 * 1024);
-        reporter.boundary(70 * 1024);
+        reporter.update(64 * 1024).unwrap();
+        reporter.boundary(70 * 1024).unwrap();
         assert_eq!(*seen.borrow(), [64 * 1024, 70 * 1024]);
     }
 
