@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.1](https://github.com/jdx/jdx-tar/compare/v1.1.0...v1.1.1) - 2026-08-28
+
+### Fixed
+
+- harden tar parsing and extraction invariants ([#22](https://github.com/jdx/jdx-tar/pull/22))
+
+### Other
+
+- *(deps)* lock file maintenance ([#21](https://github.com/jdx/jdx-tar/pull/21))
+- *(ci)* use runner-provided Rust ([#20](https://github.com/jdx/jdx-tar/pull/20))
+- *(deps)* lock file maintenance ([#17](https://github.com/jdx/jdx-tar/pull/17))
+- *(deps)* update actions/checkout digest to 3d3c42e ([#15](https://github.com/jdx/jdx-tar/pull/15))
+- *(deps)* pin dependencies ([#13](https://github.com/jdx/jdx-tar/pull/13))
+- *(deps)* update actions/checkout action to v7 ([#14](https://github.com/jdx/jdx-tar/pull/14))
+
 ## [1.1.0](https://github.com/jdx/jdx-tar/compare/v1.0.0...v1.1.0) - 2026-07-16
 
 ### Added
