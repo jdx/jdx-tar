@@ -126,6 +126,7 @@ pub(super) struct DeferredDirectory {
 
 impl DeferredDirectory {
     fn new(path: PathBuf, mode: u32, mtime: i64) -> Result<Self> {
+        let path = fs::canonicalize(path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_dir() {
             return Err(invalid("archive directory is not a directory"));
@@ -373,7 +374,7 @@ pub(super) fn unpack_archive<R: Read>(
                 )?);
                 summary.dirs += 1;
             }
-            EntryType::File | EntryType::Other(_) => {
+            EntryType::File => {
                 if !prepare_output(&output, opts.overwrite)? {
                     summary.skipped.push(SkippedEntry {
                         path: original,
@@ -582,7 +583,7 @@ pub(super) fn unpack_entry<R: Read>(
             )?);
             summary.dirs = 1;
         }
-        EntryType::File | EntryType::Other(_) => {
+        EntryType::File => {
             if !prepare_output(&output, opts.overwrite)? {
                 summary.skipped.push(SkippedEntry {
                     path: original,
