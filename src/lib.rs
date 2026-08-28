@@ -512,23 +512,27 @@ impl<R: Read> Entries<'_, R> {
                     })
                     .cloned(),
             );
-            if self.long_name.is_some() && pax_value(&pax, "path").is_some() {
+            if self.long_name.is_some()
+                && pax_value(&pax, "path").is_some_and(|path| !path.is_empty())
+            {
                 return Err(invalid(
                     "PAX path and GNU long-name describe the same entry",
                 ));
             }
-            if self.long_link.is_some() && pax_value(&pax, "linkpath").is_some() {
+            if self.long_link.is_some()
+                && pax_value(&pax, "linkpath").is_some_and(|link| !link.is_empty())
+            {
                 return Err(invalid(
                     "PAX linkpath and GNU long-link describe the same entry",
                 ));
             }
+            apply_pax_header(&mut header, &pax)?;
             if let Some(name) = self.long_name.take() {
                 header.path = name;
             }
             if let Some(link) = self.long_link.take() {
                 header.link_name = Some(link);
             }
-            apply_pax_header(&mut header, &pax)?;
 
             // GNU sparse PAX archives use the tar header's size for the packed
             // body. Some writers (notably Go's archive/tar) also emit a PAX
@@ -569,6 +573,7 @@ impl<R: Read> Entries<'_, R> {
             }
             if matches!(flag, b'1' | b'2')
                 && pax_value(&pax, "linkpath").is_some_and(<[u8]>::is_empty)
+                && header.link_name.as_ref().is_none_or(Vec::is_empty)
             {
                 return Err(invalid(
                     "PAX linkpath deletion leaves link without a target",
