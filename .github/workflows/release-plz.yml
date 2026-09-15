@@ -22,7 +22,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Publish releases
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
         with:
           command: release
         env:
@@ -45,7 +45,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Open or update release PR
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
         with:
           command: release-pr
         env:
