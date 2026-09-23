@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.2](https://github.com/jdx/jdx-tar/compare/v1.1.1...v1.1.2) - 2026-09-23
+
+### Other
+
+- *(deps)* lock file maintenance ([#24](https://github.com/jdx/jdx-tar/pull/24))
+- *(deps)* update release-plz/action action to v0.5.137 ([#29](https://github.com/jdx/jdx-tar/pull/29))
+- add entire trail runners ([#28](https://github.com/jdx/jdx-tar/pull/28))
+- *(deps)* update release-plz/action action to v0.5.134 ([#27](https://github.com/jdx/jdx-tar/pull/27))
+- *(deps)* update release-plz/action action to v0.5.133 ([#25](https://github.com/jdx/jdx-tar/pull/25))
+
 ## [1.1.1](https://github.com/jdx/jdx-tar/compare/v1.1.0...v1.1.1) - 2026-08-28
 
 ### Fixed
