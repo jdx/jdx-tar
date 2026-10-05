@@ -27,3 +27,6 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[profile.dev]
+debug = 1
