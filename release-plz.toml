@@ -1,0 +1,3 @@
+[workspace]
+# Label the release PR so it is easy to find and filter.
+pr_labels = ["release"]
