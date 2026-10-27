@@ -34,6 +34,7 @@ pub(super) fn parse_header(block: &[u8; 512]) -> Result<Header> {
         gid: parse_number(&block[116..124])?,
         stored_size: parse_number(&block[124..136])?,
         mtime: parse_signed_number(&block[136..148])?,
+        mtime_deleted: false,
         type_flag: block[156],
     })
 }
@@ -179,17 +180,37 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
     if let Some(link) = pax_value(pax, "linkpath") {
         header.link_name = (!link.is_empty()).then(|| link.to_vec());
     }
-    if let Some(size) = pax_u64_checked(pax, "size")? {
-        header.stored_size = size;
+    // POSIX: a zero-length value deletes the keyword and the header block
+    // field it overrides. uid and gid then read as zero and mtime is marked
+    // absent. The entry size frames the stream, so deleting it is an error.
+    if let Some(value) = pax_value(pax, "size") {
+        if value.is_empty() {
+            return Err(invalid("PAX size deletion leaves entry without a size"));
+        }
+        header.stored_size = parse_decimal(value)?;
     }
-    if let Some(uid) = pax_u64_checked(pax, "uid")? {
-        header.uid = uid;
+    if let Some(value) = pax_value(pax, "uid") {
+        header.uid = if value.is_empty() {
+            0
+        } else {
+            parse_decimal(value)?
+        };
     }
-    if let Some(gid) = pax_u64_checked(pax, "gid")? {
-        header.gid = gid;
+    if let Some(value) = pax_value(pax, "gid") {
+        header.gid = if value.is_empty() {
+            0
+        } else {
+            parse_decimal(value)?
+        };
     }
     if let Some(mtime) = pax_text_checked(pax, "mtime")? {
-        header.mtime = parse_pax_mtime(mtime)?;
+        if mtime.is_empty() {
+            header.mtime = 0;
+            header.mtime_deleted = true;
+        } else {
+            header.mtime = parse_pax_mtime(mtime)?;
+            header.mtime_deleted = false;
+        }
     }
     Ok(())
 }

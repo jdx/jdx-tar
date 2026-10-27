@@ -122,6 +122,7 @@ pub struct Header {
     gid: u64,
     stored_size: u64,
     mtime: i64,
+    mtime_deleted: bool,
     type_flag: u8,
 }
 
@@ -141,6 +142,7 @@ impl Header {
             gid: 0,
             stored_size: 0,
             mtime: 0,
+            mtime_deleted: false,
             type_flag: entry_type.type_flag(),
         }
     }
@@ -169,6 +171,15 @@ impl Header {
     #[must_use]
     pub const fn mtime(&self) -> i64 {
         self.mtime
+    }
+    /// Whether the entry has a modification time.
+    ///
+    /// A zero-length pax `mtime` record deletes the field, so this is `false`
+    /// and [`mtime`](Self::mtime) reads as zero. Extraction leaves such files
+    /// with the time they were written.
+    #[must_use]
+    pub const fn has_mtime(&self) -> bool {
+        !self.mtime_deleted
     }
     /// Raw tar type flag.
     #[must_use]
@@ -199,6 +210,7 @@ impl Header {
     /// Sets the modification time as seconds since the Unix epoch.
     pub const fn set_mtime(&mut self, mtime: i64) {
         self.mtime = mtime;
+        self.mtime_deleted = false;
     }
 
     /// Link target, when present.

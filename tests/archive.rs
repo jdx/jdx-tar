@@ -1,4 +1,4 @@
-use jdx_tar::{Archive, EntryUnpacker, SparseSegment, UnpackOptions};
+use jdx_tar::{Archive, Builder, EntryUnpacker, SparseSegment, UnpackOptions};
 #[cfg(unix)]
 use jdx_tar::{EntryType, SkipReason};
 #[cfg(unix)]
@@ -97,6 +97,111 @@ fn reads_dense_and_pax_path() {
     entry.read_to_string(&mut body).unwrap();
     assert_eq!(body, "hello");
     assert!(entries.next().is_none());
+}
+
+#[test]
+fn empty_pax_numeric_records_delete_the_field() {
+    let mut tar = Vec::new();
+    let global = [("uid", "1000"), ("gid", "1000"), ("mtime", "5")]
+        .iter()
+        .map(|(key, value)| pax_record(key, value))
+        .collect::<String>()
+        .into_bytes();
+    append_entry(
+        &mut tar,
+        header("PaxHeaders/global", global.len() as u64, b'g'),
+        &global,
+    );
+    let (local, local_block) = pax_header(&[("uid", ""), ("mtime", "")]);
+    append_entry(&mut tar, local_block, &local);
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    append_entry(&mut tar, header("b.txt", 5, b'0'), b"world");
+    let (tombstone, tombstone_block) = pax_header(&[("gid", "")]);
+    append_entry(&mut tar, tombstone_block, &tombstone);
+    append_entry(&mut tar, header("c.txt", 5, b'0'), b"again");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    // The local tombstones delete the field instead of restoring the ustar
+    // value or falling back to the global one; gid keeps its global value.
+    let a = entries.next().unwrap().unwrap();
+    assert_eq!(a.header().uid(), 0);
+    assert!(!a.header().has_mtime());
+    assert_eq!(a.header().mtime(), 0);
+    assert_eq!(a.header().gid(), 1000);
+    drop(a);
+    let b = entries.next().unwrap().unwrap();
+    assert_eq!(b.header().uid(), 1000);
+    assert!(b.header().has_mtime());
+    assert_eq!(b.header().mtime(), 5);
+    drop(b);
+    let c = entries.next().unwrap().unwrap();
+    assert_eq!(c.header().gid(), 0);
+}
+
+#[test]
+fn global_pax_mtime_tombstone_persists_and_extraction_skips_the_time() {
+    let mut tar = Vec::new();
+    let global = pax_record("mtime", "").into_bytes();
+    append_entry(
+        &mut tar,
+        header("PaxHeaders/global", global.len() as u64, b'g'),
+        &global,
+    );
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let dir = tempfile::tempdir().unwrap();
+    Archive::new(Cursor::new(tar))
+        .unpack(dir.path(), &mut UnpackOptions::default())
+        .unwrap();
+    let modified = std::fs::metadata(dir.path().join("a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    // The ustar header says 2023-11-14; a deleted mtime must not restore it.
+    assert!(modified.elapsed().unwrap().as_secs() < 3600);
+}
+
+#[test]
+fn builder_rejects_a_header_without_mtime() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[("mtime", "")]);
+    append_entry(&mut tar, pax_block, &pax);
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let entry = entries.next().unwrap().unwrap();
+    let mut copy = entry.header().clone();
+    assert!(!copy.has_mtime());
+
+    let mut out = Vec::new();
+    let mut builder = Builder::new(&mut out);
+    let err = builder
+        .append_data(&mut copy, "a.txt", &b"hello"[..])
+        .unwrap_err();
+    assert!(err.to_string().contains("set_mtime"), "{err}");
+    copy.set_mtime(7);
+    assert!(copy.has_mtime());
+    builder
+        .append_data(&mut copy, "a.txt", &b"hello"[..])
+        .unwrap();
+}
+
+#[test]
+fn pax_size_deletion_is_rejected() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[("size", "")]);
+    append_entry(&mut tar, pax_block, &pax);
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    assert!(entries.next().unwrap().is_err());
 }
 
 #[test]

@@ -119,13 +119,13 @@ pub struct EntryUnpacker<'a> {
 pub(super) struct DeferredDirectory {
     path: PathBuf,
     mode: u32,
-    mtime: i64,
+    mtime: Option<i64>,
     #[cfg(unix)]
     identity: (u64, u64),
 }
 
 impl DeferredDirectory {
-    fn new(path: PathBuf, mode: u32, mtime: i64) -> Result<Self> {
+    fn new(path: PathBuf, mode: u32, mtime: Option<i64>) -> Result<Self> {
         let path = fs::canonicalize(path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_dir() {
@@ -347,7 +347,7 @@ pub(super) fn unpack_archive<R: Read>(
         validate_mtime_before_output(
             entry.kind,
             entry.header.mtime,
-            opts.preserve_mtime,
+            opts.preserve_mtime && entry.header.has_mtime(),
             &output,
             opts.overwrite,
         )?;
@@ -370,7 +370,7 @@ pub(super) fn unpack_archive<R: Read>(
                 deferred_dirs.push(DeferredDirectory::new(
                     output,
                     entry.header.mode,
-                    entry.header.mtime,
+                    entry.header.has_mtime().then_some(entry.header.mtime),
                 )?);
                 summary.dirs += 1;
             }
@@ -406,7 +406,7 @@ pub(super) fn unpack_archive<R: Read>(
                     entry.header.mode,
                     entry.header.mtime,
                     preserve_permissions,
-                    preserve_mtime,
+                    preserve_mtime && entry.header.has_mtime(),
                 )?;
                 summary.files += 1;
             }
@@ -555,7 +555,7 @@ pub(super) fn unpack_entry<R: Read>(
     validate_mtime_before_output(
         entry.kind,
         entry.header.mtime,
-        opts.preserve_mtime,
+        opts.preserve_mtime && entry.header.has_mtime(),
         &output,
         opts.overwrite,
     )?;
@@ -579,7 +579,7 @@ pub(super) fn unpack_entry<R: Read>(
             deferred_dirs.push(DeferredDirectory::new(
                 output,
                 entry.header.mode,
-                entry.header.mtime,
+                entry.header.has_mtime().then_some(entry.header.mtime),
             )?);
             summary.dirs = 1;
         }
@@ -618,7 +618,7 @@ pub(super) fn unpack_entry<R: Read>(
                 entry.header.mode,
                 entry.header.mtime,
                 opts.preserve_permissions,
-                opts.preserve_mtime,
+                opts.preserve_mtime && entry.header.has_mtime(),
             )?;
             summary.files = 1;
         }
@@ -936,8 +936,8 @@ fn apply_directory_metadata(
             fs::Permissions::from_mode(directory.mode & 0o7777),
         )?;
     }
-    if preserve_mtime {
-        let time = filetime::FileTime::from_unix_time(directory.mtime, 0);
+    if let Some(mtime) = directory.mtime.filter(|_| preserve_mtime) {
+        let time = filetime::FileTime::from_unix_time(mtime, 0);
         #[cfg(unix)]
         {
             // Restore time without reopening a directory whose archived mode
