@@ -226,7 +226,9 @@ pub(super) fn parse_sparse_csv(value: &str) -> Result<Vec<SparseSegment>> {
         return Err(invalid("sparse map has too many segments"));
     }
     Ok(values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| SparseSegment {
             offset: pair[0],
             len: pair[1],
