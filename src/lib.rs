@@ -638,7 +638,7 @@ impl<R: Read> Entries<'_, R> {
             return Err(invalid("old GNU sparse entry lacks a GNU header"));
         }
         let mut map = Vec::new();
-        for chunk in block[386..482].chunks_exact(24) {
+        for chunk in block[386..482].as_chunks::<24>().0 {
             if !push_sparse_pair(&mut map, &chunk[..12], &chunk[12..])? {
                 break;
             }
@@ -655,7 +655,7 @@ impl<R: Read> Entries<'_, R> {
             }
             let mut ext = [0_u8; 512];
             self.state.borrow_mut().read_exact_counted(&mut ext)?;
-            for chunk in ext[..504].chunks_exact(24) {
+            for chunk in ext[..504].as_chunks::<24>().0 {
                 if !push_sparse_pair(&mut map, &chunk[..12], &chunk[12..])? {
                     break;
                 }

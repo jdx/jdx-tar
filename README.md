@@ -121,7 +121,7 @@ for per-file status messages.
 
 ## Minimum supported Rust version
 
-Rust 1.85 (edition 2024).
+Rust 1.95 (edition 2024).
 
 ## Acknowledgements
 
