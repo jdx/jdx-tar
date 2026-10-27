@@ -1,4 +1,4 @@
-use jdx_tar::{Archive, EntryUnpacker, SparseSegment, UnpackOptions};
+use jdx_tar::{Archive, Builder, EntryUnpacker, SparseSegment, UnpackOptions};
 #[cfg(unix)]
 use jdx_tar::{EntryType, SkipReason};
 #[cfg(unix)]
@@ -162,6 +162,33 @@ fn global_pax_mtime_tombstone_persists_and_extraction_skips_the_time() {
         .unwrap();
     // The ustar header says 2023-11-14; a deleted mtime must not restore it.
     assert!(modified.elapsed().unwrap().as_secs() < 3600);
+}
+
+#[test]
+fn builder_rejects_a_header_without_mtime() {
+    let mut tar = Vec::new();
+    let (pax, pax_block) = pax_header(&[("mtime", "")]);
+    append_entry(&mut tar, pax_block, &pax);
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let entry = entries.next().unwrap().unwrap();
+    let mut copy = entry.header().clone();
+    assert!(!copy.has_mtime());
+
+    let mut out = Vec::new();
+    let mut builder = Builder::new(&mut out);
+    let err = builder
+        .append_data(&mut copy, "a.txt", &b"hello"[..])
+        .unwrap_err();
+    assert!(err.to_string().contains("set_mtime"), "{err}");
+    copy.set_mtime(7);
+    assert!(copy.has_mtime());
+    builder
+        .append_data(&mut copy, "a.txt", &b"hello"[..])
+        .unwrap();
 }
 
 #[test]

@@ -258,6 +258,13 @@ fn long_record_size(value: &[u8]) -> Result<u64> {
 }
 
 fn encode_header(header: &Header) -> Result<[u8; BLOCK_LEN]> {
+    // The writer emits no pax records, so a deleted mtime would become an
+    // explicit zero, and readers would restore it as 1970.
+    if !header.has_mtime() {
+        return Err(invalid(
+            "tar header has no modification time; call set_mtime to write one",
+        ));
+    }
     let mut block = [0_u8; BLOCK_LEN];
     write_bytes(&mut block[..NAME_LEN], &header.path);
     write_numeric(&mut block[100..108], u64::from(header.mode), "mode")?;
