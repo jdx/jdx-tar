@@ -100,6 +100,42 @@ fn reads_dense_and_pax_path() {
 }
 
 #[test]
+fn empty_pax_numeric_records_delete_the_override() {
+    let mut tar = Vec::new();
+    let global = [("uid", "1000"), ("gid", "1000"), ("mtime", "5")]
+        .iter()
+        .map(|(key, value)| pax_record(key, value))
+        .collect::<String>()
+        .into_bytes();
+    append_entry(
+        &mut tar,
+        header("PaxHeaders/global", global.len() as u64, b'g'),
+        &global,
+    );
+    let (local, local_block) = pax_header(&[("uid", ""), ("mtime", ""), ("size", "")]);
+    append_entry(&mut tar, local_block, &local);
+    append_entry(&mut tar, header("a.txt", 5, b'0'), b"hello");
+    append_entry(&mut tar, header("b.txt", 5, b'0'), b"world");
+    terminate(&mut tar);
+
+    let mut archive = Archive::new(Cursor::new(tar));
+    let mut entries = archive.entries().unwrap();
+    let mut a = entries.next().unwrap().unwrap();
+    // The local tombstones restore the ustar header values; gid stays global.
+    assert_eq!(a.header().uid(), 0);
+    assert_eq!(a.header().mtime(), 1_700_000_000);
+    assert_eq!(a.header().gid(), 1000);
+    assert_eq!(a.size(), 5);
+    let mut body = String::new();
+    a.read_to_string(&mut body).unwrap();
+    assert_eq!(body, "hello");
+    drop(a);
+    let b = entries.next().unwrap().unwrap();
+    assert_eq!(b.header().uid(), 1000);
+    assert_eq!(b.header().mtime(), 5);
+}
+
+#[test]
 fn securely_unpacks_selected_entries() {
     let mut tar = Vec::new();
     append_entry(&mut tar, header("root/whiteout", 3, b'0'), b"old");

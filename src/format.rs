@@ -179,19 +179,28 @@ pub(super) fn apply_pax_header(header: &mut Header, pax: &[(String, Vec<u8>)]) -
     if let Some(link) = pax_value(pax, "linkpath") {
         header.link_name = (!link.is_empty()).then(|| link.to_vec());
     }
-    if let Some(size) = pax_u64_checked(pax, "size")? {
+    // POSIX: a zero-length value deletes the keyword, so the ustar header
+    // field stands for these numeric overrides.
+    if let Some(size) = pax_live_u64(pax, "size")? {
         header.stored_size = size;
     }
-    if let Some(uid) = pax_u64_checked(pax, "uid")? {
+    if let Some(uid) = pax_live_u64(pax, "uid")? {
         header.uid = uid;
     }
-    if let Some(gid) = pax_u64_checked(pax, "gid")? {
+    if let Some(gid) = pax_live_u64(pax, "gid")? {
         header.gid = gid;
     }
-    if let Some(mtime) = pax_text_checked(pax, "mtime")? {
+    if let Some(mtime) = pax_text_checked(pax, "mtime")?.filter(|value| !value.is_empty()) {
         header.mtime = parse_pax_mtime(mtime)?;
     }
     Ok(())
+}
+
+fn pax_live_u64(pax: &[(String, Vec<u8>)], key: &str) -> Result<Option<u64>> {
+    if pax_value(pax, key).is_some_and(<[u8]>::is_empty) {
+        return Ok(None);
+    }
+    pax_u64_checked(pax, key)
 }
 
 pub(super) fn pax_value<'a>(pax: &'a [(String, Vec<u8>)], key: &str) -> Option<&'a [u8]> {
