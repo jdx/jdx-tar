@@ -971,6 +971,12 @@ fn is_reserved_path(path: &Path) -> bool {
             return false;
         };
         let value = value.to_string_lossy();
+        // `name:stream` writes an NTFS alternate data stream, and
+        // `dir::$INDEX_ALLOCATION` names the directory itself, so a colon
+        // never belongs in a member name.
+        if value.contains(':') {
+            return true;
+        }
         let stem = value
             .trim_end_matches([' ', '.'])
             .split('.')
@@ -1087,6 +1093,14 @@ mod tests {
     #[test]
     fn reserved_names_follow_platform_rules() {
         assert_eq!(is_reserved_path(Path::new("CON.txt")), cfg!(windows));
+        assert_eq!(
+            is_reserved_path(Path::new("dir/file:stream")),
+            cfg!(windows)
+        );
+        assert_eq!(
+            is_reserved_path(Path::new("dir::$INDEX_ALLOCATION")),
+            cfg!(windows)
+        );
         assert!(!is_reserved_path(Path::new("ordinary.txt")));
     }
 }
