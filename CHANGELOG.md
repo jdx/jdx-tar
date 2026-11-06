@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.3](https://github.com/jdx/jdx-tar/compare/v1.1.2...v1.1.3) - 2026-11-06
+
+### Other
+
+- *(deps)* update release-plz/action action to v0.5.147 ([#45](https://github.com/jdx/jdx-tar/pull/45))
+- *(deps)* lock file maintenance ([#44](https://github.com/jdx/jdx-tar/pull/44))
+- *(deps)* update release-plz/action action to v0.5.145 ([#43](https://github.com/jdx/jdx-tar/pull/43))
+- *(deps)* update release-plz/action action to v0.5.144 ([#41](https://github.com/jdx/jdx-tar/pull/41))
+
 ## [1.1.2](https://github.com/jdx/jdx-tar/compare/v1.1.1...v1.1.2) - 2026-10-27
 
 ### Fixed
