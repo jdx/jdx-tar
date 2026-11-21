@@ -99,6 +99,82 @@ fn reads_dense_and_pax_path() {
     assert!(entries.next().is_none());
 }
 
+// Maven's plexus-archiver writes `ustar\0` with a `\0\0` version, which
+// GNU tar and libarchive read as ustar.
+fn with_identity(mut block: [u8; 512], identity: [u8; 8]) -> [u8; 512] {
+    block[257..265].copy_from_slice(&identity);
+    finish_header(&mut block);
+    block
+}
+
+fn read_paths(tar: Vec<u8>) -> Vec<(String, Option<String>)> {
+    let mut archive = Archive::new(Cursor::new(tar));
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.path().unwrap().to_string_lossy().into_owned(),
+                entry
+                    .header()
+                    .link_name()
+                    .map(|link| link.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn reads_extensions_and_prefix_regardless_of_ustar_version() {
+    let long = format!("tool/{}/{}/file.txt", "a".repeat(60), "b".repeat(60));
+    let long_target = format!("{}/{}/target.txt", "c".repeat(60), "d".repeat(60));
+
+    for identity in [*b"ustar\0\0\0", *b"ustar\0  ", *b"ustar\0 \0", *b"ustar   "] {
+        let mut tar = Vec::new();
+
+        let name = format!("{long}\0");
+        append_entry(
+            &mut tar,
+            with_identity(header("././@LongLink", name.len() as u64, b'L'), identity),
+            name.as_bytes(),
+        );
+        let target = format!("{long_target}\0");
+        append_entry(
+            &mut tar,
+            with_identity(header("././@LongLink", target.len() as u64, b'K'), identity),
+            target.as_bytes(),
+        );
+        let mut link = header(&long[..100], 0, b'2');
+        link[157..257].copy_from_slice(&long_target.as_bytes()[..100]);
+        append_entry(&mut tar, with_identity(link, identity), &[]);
+
+        if identity.starts_with(b"ustar\0") {
+            let (pax, pax_block) = pax_header(&[("path", "pax/long/path.txt")]);
+            append_entry(&mut tar, with_identity(pax_block, identity), &pax);
+            append_entry(
+                &mut tar,
+                with_identity(header("ignored", 0, b'0'), identity),
+                &[],
+            );
+
+            let mut prefixed = header("file.txt", 0, b'0');
+            prefixed[345..356].copy_from_slice(b"prefix/path");
+            append_entry(&mut tar, with_identity(prefixed, identity), &[]);
+        }
+
+        terminate(&mut tar);
+
+        let mut expected = vec![(long.clone(), Some(long_target.clone()))];
+        if identity.starts_with(b"ustar\0") {
+            expected.push(("pax/long/path.txt".into(), None));
+            expected.push(("prefix/path/file.txt".into(), None));
+        }
+
+        assert_eq!(read_paths(tar), expected, "identity {identity:?}");
+    }
+}
+
 #[test]
 fn empty_pax_numeric_records_delete_the_field() {
     let mut tar = Vec::new();

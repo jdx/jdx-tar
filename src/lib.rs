@@ -413,9 +413,12 @@ impl<R: Read> Entries<'_, R> {
             let flag = header.type_flag;
             let size = header.stored_size;
 
-            let identity = &block[257..265];
-            let is_ustar = identity == b"ustar\x0000";
-            let is_gnu = identity == b"ustar  \0";
+            // Only the magic identifies the format, as in GNU tar and
+            // libarchive. Some writers emit other version bytes, such as
+            // Maven's plexus-archiver, which writes `ustar\0` with `\0\0`.
+            let magic = &block[257..263];
+            let is_ustar = magic == b"ustar\0";
+            let is_gnu = magic == b"ustar ";
             if matches!(flag, b'x' | b'g') && !is_ustar {
                 return Err(invalid("PAX extension requires a USTAR carrier"));
             }
