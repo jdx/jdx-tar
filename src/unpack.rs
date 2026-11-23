@@ -887,6 +887,19 @@ fn apply_deferred_directory_metadata(
     Ok(())
 }
 
+/// `UNIX_EPOCH` plus `seconds`, or an error when the platform cannot represent
+/// it. `SystemTime`'s `+` operator panics instead, and a crafted archive
+/// controls this value.
+fn system_time_from_unix(seconds: i64) -> Result<std::time::SystemTime> {
+    let offset = std::time::Duration::from_secs(seconds.unsigned_abs());
+    let time = if seconds >= 0 {
+        std::time::UNIX_EPOCH.checked_add(offset)
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(offset)
+    };
+    time.ok_or_else(|| invalid("archive modification time is out of range"))
+}
+
 fn apply_file_metadata(
     file: &fs::File,
     mode: u32,
@@ -902,7 +915,7 @@ fn apply_file_metadata(
         file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
     }
     if preserve_mtime {
-        let time = std::time::SystemTime::from(filetime::FileTime::from_unix_time(mtime, 0));
+        let time = system_time_from_unix(mtime)?;
         file.set_times(fs::FileTimes::new().set_modified(time))?;
     }
     Ok(())
@@ -949,7 +962,7 @@ fn apply_directory_metadata(
             // callbacks; concurrent tree mutation remains outside the contract.
             filetime::set_symlink_file_times(
                 &directory.path,
-                filetime::FileTime::from(metadata.accessed()?),
+                filetime::FileTime::from_system_time(metadata.accessed()?),
                 time,
             )?;
         }
