@@ -902,12 +902,16 @@ fn apply_file_metadata(
         file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
     }
     if preserve_mtime {
-        let time = filetime::FileTime::from_unix_time(mtime, 0);
-        filetime::set_file_handle_times(file, None, Some(time))?;
+        let time = std::time::SystemTime::from(filetime::FileTime::from_unix_time(mtime, 0));
+        file.set_times(fs::FileTimes::new().set_modified(time))?;
     }
     Ok(())
 }
 
+// `fs::set_times_nofollow` and `fs::set_times` replace the two deprecated
+// `filetime` calls below, but both are stable only since Rust 1.99 and this
+// crate supports 1.95. Drop the allow when the minimum version reaches 1.99.
+#[allow(deprecated)]
 fn apply_directory_metadata(
     directory: &DeferredDirectory,
     preserve_permissions: bool,
@@ -945,7 +949,7 @@ fn apply_directory_metadata(
             // callbacks; concurrent tree mutation remains outside the contract.
             filetime::set_symlink_file_times(
                 &directory.path,
-                filetime::FileTime::from_last_access_time(&metadata),
+                filetime::FileTime::from(metadata.accessed()?),
                 time,
             )?;
         }
