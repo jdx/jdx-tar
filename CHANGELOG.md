@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.4](https://github.com/jdx/jdx-tar/compare/v1.1.3...v1.1.4) - 2026-11-27
+
+### Fixed
+
+- *(unpack)* stop using filetime calls deprecated on Rust 1.99 ([#51](https://github.com/jdx/jdx-tar/pull/51))
+
+### Other
+
+- add GitHub Actions workflow lockfile
+- *(deps)* lock file maintenance ([#50](https://github.com/jdx/jdx-tar/pull/50))
+
 ## [1.1.3](https://github.com/jdx/jdx-tar/compare/v1.1.2...v1.1.3) - 2026-11-21
 
 ### Fixed
